@@ -150,6 +150,7 @@ class RiskConfig:
 
     # Max USDC to risk on a single order as a fraction of wallet balance.
     # e.g. 0.05 = never bet more than 5% of your wallet on one trade.
+    # (Used as a fallback when dynamic sizing is disabled.)
     max_order_fraction: float = 0.05
 
     # Maximum total USDC deployed across all open positions at once,
@@ -172,8 +173,54 @@ class RiskConfig:
     balance_refresh_secs: float = 30.0
 
 
+@dataclass
+class DynamicSizingConfig:
+    """
+    Wallet-tier-based dynamic order sizing.
+
+    The bot adjusts the per-order fraction based on current wallet size so
+    that small wallets still produce orders above min_order_usdc while large
+    wallets apply increasingly conservative fractions to control absolute risk.
+
+    Each tier is a tuple of:
+        (min_wallet_usdc, order_fraction, tier_max_order_usdc)
+
+    The first tier whose min_wallet_usdc is <= the current balance is used.
+    Tiers must be listed from largest to smallest min_wallet_usdc.
+
+    Order size is computed against *available* balance (total wallet minus
+    already-deployed capital) rather than total wallet balance, so the bot
+    never over-commits just because the headline balance is large.
+
+    A secondary exposure-utilisation factor scales down order size linearly
+    as the exposure budget fills up, encouraging smaller positions when the
+    book is already crowded.
+    """
+
+    # Tiers: (min_wallet_usdc, order_fraction, tier_max_order_usdc)
+    # Evaluated top-to-bottom; first match wins.
+    tiers: list[tuple[float, float, float]] = field(default_factory=lambda: [
+        # min_wallet   fraction   max_per_order
+        (2000.0,       0.03,      50.0),   # $2 000+  wallet → 3 %, cap $50
+        (500.0,        0.04,      40.0),   # $500 +   wallet → 4 %, cap $40
+        (200.0,        0.05,      25.0),   # $200 +   wallet → 5 %, cap $25
+        (50.0,         0.07,      15.0),   # $50  +   wallet → 7 %, cap $15
+        (20.0,         0.10,       5.0),   # $20  +   wallet → 10%, cap $5
+        (0.0,          0.15,       3.0),   # <$20     wallet → 15%, cap $3
+    ])
+
+    # When exposure utilisation (deployed / max_exposure) exceeds this level,
+    # begin scaling down order size.  0.60 = scale-down starts at 60 % utilisation.
+    exposure_scale_threshold: float = 0.60
+
+    # Floor for the utilisation scale factor.
+    # 0.40 = orders are never reduced below 40 % of the tier size.
+    min_exposure_scale: float = 0.40
+
+
 STRATEGY = StrategyConfig()
 RISK = RiskConfig()
+DYNAMIC_SIZING = DynamicSizingConfig()
 
 # ---------------------------------------------------------------------------
 # Logging

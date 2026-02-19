@@ -6,27 +6,55 @@ Bet sizing strategy
 All sizing is proportional to the **live USDC wallet balance**, fetched at
 startup and refreshed every config.RISK.balance_refresh_secs seconds.
 
-Per-order size (flat momentum bets):
-    order_usdc = min(
-        wallet_balance * max_order_fraction,   # e.g. 5% of wallet
-        max_order_usdc_hard,                   # hard cap regardless of size
-        remaining_budget,                      # what's still undeployed
-    )
+Smart dynamic order sizing (_compute_smart_order_size)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Order size is calculated in three stages:
 
-Per-order size (arb bets with Kelly sizing):
+1. **Wallet-tier lookup** (config.DYNAMIC_SIZING.tiers)
+   Smaller wallets need a higher fraction to stay above min_order_usdc;
+   larger wallets use a lower fraction to bound absolute risk.
+
+   Example tiers (defaults):
+       $2 000 + wallet → 3 % of available, cap $50
+       $500  + wallet → 4 % of available, cap $40
+       $200  + wallet → 5 % of available, cap $25
+       $50   + wallet → 7 % of available, cap $15
+       $20   + wallet → 10% of available, cap $5
+       < $20   wallet → 15% of available, cap $3
+
+2. **Available-balance base** (wallet minus already-deployed USDC)
+   Sizes against what is *actually free* rather than the headline balance,
+   so the bot never over-commits when positions are already open.
+
+3. **Exposure-utilisation scale-down**
+   When the exposure budget is more than `exposure_scale_threshold` full
+   (default 60 %), order size is reduced linearly toward `min_exposure_scale`
+   × base size (default 40 %) as utilisation approaches 100 %.  This makes
+   each successive bet smaller as the book fills up.
+
+Per-order size (momentum):
+    order_usdc = _compute_smart_order_size()   # see above
+
+Per-order size (arb, Kelly-weighted):
+    smart_cap  = _compute_smart_order_size()
     kelly_usdc = kelly_f * kelly_fraction * wallet_balance
-    order_usdc = max(min_order_usdc, min(kelly_usdc, flat_order_usdc))
+    order_usdc = max(min_order_usdc, min(kelly_usdc, smart_cap))
 
 Total exposure cap:
-    max_deployed = wallet_balance * max_exposure_fraction   # e.g. 20%
+    max_deployed = wallet_balance * max_exposure_fraction   # e.g. 20 %
 
-Example with $500 wallet:
-    max_order  = min($500*0.05, $50) = $25 per bet
-    max_deploy = $500*0.20 = $100 total across all open positions
-    Kelly arb  = kelly_f * 0.25 * $500 — capped at $25
+Example with $500 wallet, 0 % utilisation:
+    tier        → 4 %, cap $40
+    available   → $500 (nothing deployed yet)
+    base_order  → $500 * 0.04 = $20
+    scale       → 1.0 (utilisation below 60 % threshold)
+    order_usdc  → min($20, $40) = $20
 
-This prevents blowing the bank: even if every trade loses, the most
-you can lose per cycle is max_order_fraction of your balance.
+Same wallet at 80 % utilisation ($80 of $100 budget deployed):
+    available   → $500 − $80 = $420
+    base_order  → $420 * 0.04 = $16.80
+    scale       → 1.0 − (1.0 − 0.40) × (0.80 − 0.60) / 0.40 ≈ 0.70
+    order_usdc  → $16.80 × 0.70 = $11.76
 """
 
 from __future__ import annotations
@@ -118,6 +146,76 @@ class OrderManager:
     def _remaining_budget(self) -> float:
         """How much more USDC we can deploy before hitting the exposure cap."""
         return max(0.0, self._max_exposure_usdc - self.total_exposure)
+
+    def _compute_smart_order_size(self, source: str = "") -> float:
+        """
+        Dynamic order size that adapts to current wallet size and exposure state.
+
+        Steps
+        -----
+        1. **Wallet-tier lookup** – selects a (fraction, cap) pair from
+           config.DYNAMIC_SIZING.tiers based on current wallet balance.
+           Smaller wallets use a larger fraction so orders stay above the
+           minimum; larger wallets use a smaller fraction to bound absolute
+           risk.
+
+        2. **Available-balance sizing** – applies the tier fraction to
+           *available* USDC (wallet minus already-deployed capital) rather
+           than the raw wallet total, so the bot never over-commits when
+           positions are already open.
+
+        3. **Exposure-utilisation scale-down** – when the exposure budget is
+           more than `exposure_scale_threshold` full, order size is reduced
+           linearly down to `min_exposure_scale` × base size.  This makes
+           each successive bet smaller as the book fills up.
+
+        4. **Clamp** – the result is clamped to
+           [0, min(tier_cap, remaining_budget)].
+
+        Returns 0.0 if nothing can safely be deployed (the caller should
+        check against config.RISK.min_order_usdc before placing an order).
+        """
+        wallet    = self._wallet_balance
+        available = self._available_balance
+        remaining = self._remaining_budget()
+
+        # --- Step 1: pick wallet tier ---
+        tier_fraction = config.RISK.max_order_fraction     # fallback defaults
+        tier_cap      = config.RISK.max_order_usdc_hard
+
+        for min_wallet, fraction, cap in config.DYNAMIC_SIZING.tiers:
+            if wallet >= min_wallet:
+                tier_fraction = fraction
+                tier_cap      = cap
+                break
+
+        # --- Step 2: base order from available balance ---
+        base_order = available * tier_fraction
+
+        # --- Step 3: exposure-utilisation scale-down ---
+        util      = (self.total_exposure / self._max_exposure_usdc
+                     if self._max_exposure_usdc > 0 else 0.0)
+        threshold = config.DYNAMIC_SIZING.exposure_scale_threshold
+        min_scale = config.DYNAMIC_SIZING.min_exposure_scale
+
+        if util > threshold:
+            # Linear interpolation: 1.0 at threshold → min_scale at 1.0
+            scale = 1.0 - (1.0 - min_scale) * (util - threshold) / (1.0 - threshold)
+        else:
+            scale = 1.0
+
+        order_usdc = min(base_order * scale, tier_cap, remaining)
+        order_usdc = max(order_usdc, 0.0)
+
+        log.debug(
+            "SmartSize[%s]  wallet=$%.2f  avail=$%.2f  tier=%.0f%%  "
+            "tier_cap=$%.2f  util=%.0f%%  scale=%.2f  → $%.2f",
+            source, wallet, available,
+            tier_fraction * 100, tier_cap,
+            util * 100, scale, order_usdc,
+        )
+
+        return order_usdc
 
     # ------------------------------------------------------------------
     # Risk helpers
@@ -212,7 +310,7 @@ class OrderManager:
             log.debug("Market %s: %s mid=%.3f outside range.", cid[:8], token_label, mid)
             return
 
-        order_usdc = min(self._max_order_usdc, self._remaining_budget())
+        order_usdc = self._compute_smart_order_size(source="MOMENTUM")
         if order_usdc < config.RISK.min_order_usdc:
             return
 
@@ -246,10 +344,13 @@ class OrderManager:
         if not self._risk_ok(sig.symbol):
             return
 
+        # Dynamic cap: smart sizing accounts for wallet tier + exposure utilisation.
+        # Kelly sizing is preserved but cannot exceed the dynamic cap.
+        smart_cap  = self._compute_smart_order_size(source="ARB")
         kelly_usdc = sig.kelly_f * config.STRATEGY.kelly_fraction * self._wallet_balance
         order_usdc = max(
             config.RISK.min_order_usdc,
-            min(kelly_usdc, self._max_order_usdc, self._remaining_budget()),
+            min(kelly_usdc, smart_cap),
         )
         if order_usdc < config.RISK.min_order_usdc:
             return
