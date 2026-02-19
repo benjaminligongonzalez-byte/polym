@@ -247,6 +247,10 @@ class MarketCache:
     # Access
     # ------------------------------------------------------------------
 
+    def get_market(self, condition_id: str) -> MarketInfo | None:
+        """Return a single market by condition ID, or None if not found."""
+        return self._markets.get(condition_id)
+
     def get_markets_for_symbol(self, symbol: str) -> list[MarketInfo]:
         """Return all active markets for the given symbol."""
         return [m for m in self._markets.values() if m.symbol == symbol]

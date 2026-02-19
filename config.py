@@ -132,6 +132,17 @@ class StrategyConfig:
     # 0.25 = quarter Kelly (conservative; good starting point).
     kelly_fraction: float = 0.25
 
+    # ---- Early exit (take-profit / sell before resolution) ----
+    # Sell a position early when Polymarket has repriced by this many cents.
+    # e.g. 0.07 = if we bought Up at 0.50, exit when it's now trading at ≥0.57.
+    # This frees capital for the next arb trade instead of waiting 10 minutes.
+    # Set to 0.0 to disable early exits entirely (hold all positions to resolution).
+    exit_take_profit: float = 0.07
+
+    # Never exit early if fewer than this many seconds remain in the window.
+    # At <90s the market is nearly resolved — selling early just wastes fees.
+    exit_min_t_rem: float = 90.0
+
     # ---- Late-window sniper mode ----
     # The target strategy: only bet in the final minutes when the outcome
     # is nearly certain but Polymarket prices haven't fully caught up yet.

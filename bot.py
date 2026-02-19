@@ -148,6 +148,8 @@ class Bot:
                 pm_client=self._pm_client,
                 on_signal=self._order_manager.execute_arb_signal,
             )
+            # Give arb strategy access to OrderManager so it can run exit scans
+            self._arb.set_order_manager(self._order_manager)
 
         # 5. Wire feeds → aggregator
         binance_cb = make_feed_callback(self._aggregator, "binance")

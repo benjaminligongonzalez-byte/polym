@@ -1,5 +1,5 @@
 """
-Order sizing and execution.
+Order sizing, execution, and early-exit management.
 
 Bet sizing strategy
 -------------------
@@ -20,13 +20,23 @@ Per-order size (arb bets with Kelly sizing):
 Total exposure cap:
     max_deployed = wallet_balance * max_exposure_fraction   # e.g. 20%
 
+Early exit (take-profit)
+------------------------
+After buying, the bot continuously monitors each open position.
+When Polymarket's current market price has risen by exit_take_profit
+(default 7¢) above the price we paid, it places a sell order:
+
+    sell if: current_mid >= entry_price + exit_take_profit
+
+This lets the bot:
+  - Lock in gains from short-lived mispricings (buy at 0.50, sell at 0.57)
+  - Redeploy capital into new arb opportunities faster
+  - Avoid 10-minute lock-ups on positions that have already repriced
+
 Example with $500 wallet:
     max_order  = min($500*0.05, $50) = $25 per bet
     max_deploy = $500*0.20 = $100 total across all open positions
     Kelly arb  = kelly_f * 0.25 * $500 — capped at $25
-
-This prevents blowing the bank: even if every trade loses, the most
-you can lose per cycle is max_order_fraction of your balance.
 """
 
 from __future__ import annotations
@@ -34,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from polymarket.client import PolymarketClient
@@ -46,9 +57,28 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Open position tracking
+# ---------------------------------------------------------------------------
+
+@dataclass
+class OpenPosition:
+    """Tracks an open bet for early-exit monitoring."""
+    condition_id: str
+    token_id: str
+    bet: str            # "Up" or "Down"
+    entry_price: float  # price we paid (limit price)
+    shares: float       # shares bought
+    cost_usdc: float    # USDC spent
+    question: str
+    symbol: str
+    is_snipe: bool
+    entered_at: float   # time.monotonic()
+
+
 class OrderManager:
     """
-    Manages order sizing, placement, and position tracking.
+    Manages order sizing, placement, position tracking, and early exits.
 
     Wallet balance is fetched at startup and kept fresh via
     run_balance_refresh_loop().
@@ -61,8 +91,8 @@ class OrderManager:
         self._last_balance_log: float = 0.0
         # condition_id → last trade timestamp (monotonic)
         self._last_trade: dict[str, float] = {}
-        # condition_id → USDC currently deployed
-        self._open_exposure: dict[str, float] = {}
+        # condition_id → OpenPosition (one position per market at a time)
+        self._positions: dict[str, OpenPosition] = {}
 
     # ------------------------------------------------------------------
     # Wallet balance management
@@ -73,7 +103,6 @@ class OrderManager:
         balance = await self._client.get_usdc_balance()
         changed = abs(balance - self._wallet_balance) > 0.01
         self._wallet_balance = balance
-        # Log balance changes and periodically as a heartbeat
         now = time.monotonic()
         if changed or now - self._last_balance_log > 300:
             log.info(
@@ -89,7 +118,7 @@ class OrderManager:
 
     async def run_balance_refresh_loop(self) -> None:
         """Background task: keep wallet balance fresh."""
-        await self.refresh_balance()          # immediate fetch on start
+        await self.refresh_balance()
         while True:
             await asyncio.sleep(config.RISK.balance_refresh_secs)
             await self.refresh_balance()
@@ -100,7 +129,6 @@ class OrderManager:
 
     @property
     def _available_balance(self) -> float:
-        """USDC balance minus what's already deployed."""
         return max(0.0, self._wallet_balance - self.total_exposure)
 
     @property
@@ -109,14 +137,12 @@ class OrderManager:
 
     @property
     def _max_order_usdc(self) -> float:
-        """Per-order cap: fraction of wallet, hard ceiling applied."""
         return min(
             self._wallet_balance * config.RISK.max_order_fraction,
             config.RISK.max_order_usdc_hard,
         )
 
     def _remaining_budget(self) -> float:
-        """How much more USDC we can deploy before hitting the exposure cap."""
         return max(0.0, self._max_exposure_usdc - self.total_exposure)
 
     # ------------------------------------------------------------------
@@ -125,7 +151,7 @@ class OrderManager:
 
     @property
     def total_exposure(self) -> float:
-        return sum(self._open_exposure.values())
+        return sum(p.cost_usdc for p in self._positions.values())
 
     def _on_cooldown(self, condition_id: str) -> bool:
         last = self._last_trade.get(condition_id, 0.0)
@@ -133,13 +159,11 @@ class OrderManager:
 
     def _too_many_positions(self, symbol: str) -> bool:
         count = sum(
-            1 for m in self._cache.all_markets()
-            if m.symbol == symbol and m.condition_id in self._open_exposure
+            1 for p in self._positions.values() if p.symbol == symbol
         )
         return count >= config.STRATEGY.max_open_positions
 
     def _risk_ok(self, symbol: str) -> bool:
-        """Combined pre-trade risk gate."""
         if self._wallet_balance < config.RISK.min_order_usdc:
             log.warning("Wallet balance $%.2f too low to trade.", self._wallet_balance)
             return False
@@ -161,14 +185,9 @@ class OrderManager:
     async def execute_signal(
         self,
         symbol: str,
-        direction: str,     # "UP" or "DOWN"
+        direction: str,
         price_move_pct: float,
     ) -> None:
-        """
-        Momentum signal: price moved fast, find matching markets and bet.
-        direction="UP"   → buy Up token
-        direction="DOWN" → buy Down token
-        """
         log.info("MOMENTUM  %-3s  %s  %.3f%%", symbol, direction, price_move_pct)
 
         if not self._risk_ok(symbol):
@@ -184,14 +203,12 @@ class OrderManager:
 
     async def _trade_momentum(self, market: MarketInfo, direction: str) -> None:
         cid = market.condition_id
-        if self._on_cooldown(cid):
+        if self._on_cooldown(cid) or cid in self._positions:
             return
 
-        # Pick the token matching the direction
         if direction == "UP":
             token = market.up_token
             token_label = "Up"
-            # Fetch fresh mid for up token
             try:
                 mid = await self._client.get_midpoint(token.token_id)
             except Exception as exc:
@@ -207,7 +224,6 @@ class OrderManager:
                 log.warning("Midpoint fetch failed %s: %s", cid[:8], exc)
                 return
 
-        # Don't chase already-extreme prices
         if not (config.STRATEGY.min_yes_prob <= mid <= config.STRATEGY.max_yes_prob):
             log.debug("Market %s: %s mid=%.3f outside range.", cid[:8], token_label, mid)
             return
@@ -223,7 +239,9 @@ class OrderManager:
             mid=mid,
             order_usdc=order_usdc,
             question=market.question,
+            symbol=market.symbol,
             source="MOMENTUM",
+            is_snipe=False,
         )
 
     # ------------------------------------------------------------------
@@ -231,21 +249,14 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     async def execute_arb_signal(self, sig: "ArbSignal") -> None:
-        """
-        Arb/Snipe signal: execute using fractional Kelly sizing vs wallet balance.
-
-        Sniper mode uses a higher Kelly multiplier because the bet is near-certain:
-            kelly_usdc = sig.kelly_f × snipe_kelly_fraction × wallet_balance
-
-        Standard arb mode uses the conservative default:
-            kelly_usdc = sig.kelly_f × kelly_fraction × wallet_balance
-
-        order_usdc = clamp(kelly_usdc, min_order_usdc, max_order_usdc)
-        """
         cid = sig.market.condition_id
 
         if self._on_cooldown(cid):
             log.debug("Market %s on cooldown (%s).", cid[:8], "snipe" if sig.is_snipe else "arb")
+            return
+
+        if cid in self._positions:
+            log.debug("Market %s already has an open position.", cid[:8])
             return
 
         if not self._risk_ok(sig.symbol):
@@ -272,11 +283,100 @@ class OrderManager:
             mid=sig.market_prob,
             order_usdc=order_usdc,
             question=sig.market.question,
+            symbol=sig.symbol,
             source=(
                 f"{mode} fair={sig.fair_prob:.3f} edge={sig.edge:.3f}"
                 f" kelly={sig.kelly_f:.3f}×{kelly_mult} wallet=${self._wallet_balance:.0f}"
             ),
+            is_snipe=sig.is_snipe,
         )
+
+    # ------------------------------------------------------------------
+    # Early exit scan
+    # ------------------------------------------------------------------
+
+    async def check_exits(self) -> None:
+        """
+        Scan all open positions and sell any that have repriced by
+        config.STRATEGY.exit_take_profit cents above the entry price.
+
+        Called every arb scan cycle (every ~2s).
+
+        Skip exits if:
+          - exit_take_profit == 0.0 (disabled)
+          - Position is a snipe with very little time left (let it resolve)
+          - Market is within exit_min_t_rem seconds of resolution
+        """
+        if config.STRATEGY.exit_take_profit == 0.0:
+            return
+        if not self._positions:
+            return
+
+        for cid, pos in list(self._positions.items()):
+            # Find market to check time remaining
+            market = self._cache.get_market(cid)
+            t_rem = market.time_remaining_secs if market else 0.0
+
+            # Don't sell within exit_min_t_rem of expiry — just let it resolve
+            if t_rem < config.STRATEGY.exit_min_t_rem:
+                continue
+
+            # Snipe positions near the end of the window are near-locks;
+            # holding to resolution collects the full $1 per share.
+            if pos.is_snipe and t_rem < config.STRATEGY.snipe_window_secs:
+                continue
+
+            # Fetch current market price for the token we hold
+            try:
+                current_mid = await self._client.get_midpoint(pos.token_id)
+            except Exception as exc:
+                log.debug("Exit check: midpoint fetch failed %s: %s", cid[:8], exc)
+                continue
+
+            profit_per_share = current_mid - pos.entry_price
+
+            if profit_per_share < config.STRATEGY.exit_take_profit:
+                continue
+
+            # Take-profit threshold reached — sell
+            total_profit_usdc = profit_per_share * pos.shares
+            log.info(
+                "EXIT  %-3s  %s  %s  entry=%.4f  now=%.4f  "
+                "profit=+$%.2f (%.1f%%)  t_rem=%.0fs",
+                pos.symbol, cid[:8], pos.bet,
+                pos.entry_price, current_mid,
+                total_profit_usdc,
+                profit_per_share / pos.entry_price * 100,
+                t_rem,
+            )
+            await self._sell_position(pos, current_mid)
+
+    async def _sell_position(self, pos: OpenPosition, current_mid: float) -> None:
+        """Place a sell limit order slightly below mid to ensure quick fill."""
+        sell_price = round(max(current_mid - config.RISK.slippage_tolerance, 0.01), 4)
+
+        log.info(
+            "[EXIT]  Sell %-4s  %s  @ %.4f  (%.2f shares / est. $%.2f USDC)"
+            "  wallet=$%.2f",
+            pos.bet, pos.question[:50],
+            sell_price, pos.shares, sell_price * pos.shares,
+            self._wallet_balance,
+        )
+
+        resp = await self._client.create_limit_order(
+            token_id=pos.token_id,
+            side="SELL",
+            price=sell_price,
+            size=pos.shares,
+        )
+
+        if resp is not None:
+            self._positions.pop(pos.condition_id, None)
+            self._last_trade[pos.condition_id] = time.monotonic()
+            log.info(
+                "Position exited early.  cid=%s  total_exposure=$%.2f",
+                pos.condition_id[:8], self.total_exposure,
+            )
 
     # ------------------------------------------------------------------
     # Shared placement helper
@@ -290,7 +390,9 @@ class OrderManager:
         mid: float,
         order_usdc: float,
         question: str,
+        symbol: str,
         source: str,
+        is_snipe: bool,
     ) -> None:
         limit_price = round(min(mid + config.RISK.slippage_tolerance, 0.99), 4)
         shares = round(order_usdc / limit_price, 2)
@@ -312,8 +414,17 @@ class OrderManager:
 
         if resp is not None:
             self._last_trade[cid] = time.monotonic()
-            self._open_exposure[cid] = (
-                self._open_exposure.get(cid, 0.0) + order_usdc
+            self._positions[cid] = OpenPosition(
+                condition_id=cid,
+                token_id=token_id,
+                bet=token_label,
+                entry_price=limit_price,
+                shares=shares,
+                cost_usdc=order_usdc,
+                question=question,
+                symbol=symbol,
+                is_snipe=is_snipe,
+                entered_at=time.monotonic(),
             )
             log.info(
                 "Order recorded.  cid=%s  total_exposure=$%.2f / $%.2f (%.0f%%)",
@@ -328,6 +439,6 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     def record_resolution(self, condition_id: str) -> None:
-        """Call when a market resolves to free up tracked exposure."""
-        self._open_exposure.pop(condition_id, None)
+        """Call when a market resolves to free up tracked position."""
+        self._positions.pop(condition_id, None)
         self._last_trade.pop(condition_id, None)

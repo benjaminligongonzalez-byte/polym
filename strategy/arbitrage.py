@@ -48,7 +48,7 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from typing import Callable, Awaitable, Optional
+from typing import Any, Callable, Awaitable, Optional
 
 from feeds.aggregator import PriceAggregator
 from polymarket.markets import MarketCache, MarketInfo
@@ -146,10 +146,18 @@ class ArbStrategy:
         self._on_signal = on_signal
         # condition_id → monotonic timestamp of last emitted signal
         self._last_signal: dict[str, float] = {}
+        self._order_manager: Any = None
+
+    def set_order_manager(self, order_manager: Any) -> None:
+        """Wire in the OrderManager so we can trigger exit scans."""
+        self._order_manager = order_manager
 
     async def run(self) -> None:
         while True:
             await asyncio.sleep(config.STRATEGY.arb_scan_interval)
+            # Check early exits first (free up capital before scanning for new entries)
+            if self._order_manager is not None:
+                await self._order_manager.check_exits()
             await self._scan_all()
 
     async def _scan_all(self) -> None:
