@@ -132,6 +132,14 @@ class StrategyConfig:
     # Sniper mode has its own separate gate (snipe_min_fair_prob, default 0.75).
     arb_min_fair_prob: float = 0.65
 
+    # Minimum |d2| (vol-adjusted standard deviations from strike) for ARB entries.
+    # d2 = [ln(S/K) - ½σ²T] / (σ√T) — the same value used in the fair_prob model.
+    # When |d2| < 1.1 the price is less than 1.1σ from the strike, meaning a small
+    # adverse move collapses fair probability by 20–30 points and forces a stop-loss
+    # exit.  This scales automatically with asset volatility and time remaining, unlike
+    # a flat %-distance check.  Set to 0.0 to disable.
+    arb_min_d2: float = 1.1
+
     # How often (seconds) to scan all markets for arb opportunities
     arb_scan_interval: float = 2.0
 

@@ -50,6 +50,9 @@ HOUSE_SPREAD   = 0.02
 
 ARB_EDGE       = 0.05
 ARB_MIN_PROB   = 0.65      # minimum fair probability for any ARB entry
+ARB_MIN_D2     = 1.1       # minimum |d2| for ARB entries: price must be ≥1.1σ from strike
+                            # Guards against near-the-money bets where a tiny adverse move
+                            # collapses fair probability (e.g. XRP 0.6% from strike with 810s left)
 SNIPE_WINDOW   = 300.0     # seconds — activate in final 5 min
 SNIPE_MIN_PROB = 0.92      # minimum fair probability in sniper mode
 SNIPE_MIN_PRICE_DIST_PCT = 0.010  # price must be ≥1% past strike to snipe
@@ -380,6 +383,21 @@ def evaluate(
     # blocks borderline snipes where a small reversal causes a full loss.
     if is_snipe and abs(live_price - strike) / strike < SNIPE_MIN_PRICE_DIST_PCT:
         return None
+
+    # ARB mode: require |d2| ≥ ARB_MIN_D2.
+    # d2 is the number of vol-adjusted standard deviations the price sits from
+    # the strike.  When |d2| is small (< 1.1), a single-digit % adverse move
+    # can shift fair probability by 20–30 points, invalidating the trade thesis
+    # and forcing a stop-loss exit at a loss.  This scales correctly with both
+    # asset volatility and time remaining — a flat %-distance check does not.
+    # (Sniper mode uses its own distance gate above; this applies only to ARB.)
+    if not is_snipe:
+        T_arb   = max(t_rem, 1.0) / (365.25 * 24.0 * 3600.0)
+        sqt_arb = vol * math.sqrt(T_arb)
+        if sqt_arb > 0:
+            d2_abs = abs((math.log(live_price / strike) - 0.5 * vol**2 * T_arb) / sqt_arb)
+            if d2_abs < ARB_MIN_D2:
+                return None
 
     edge_up   = p_up   - up_mid
     edge_down = p_down - down_mid

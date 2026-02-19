@@ -235,6 +235,27 @@ class ArbStrategy:
                 )
                 return
 
+        # --- 5d. ARB mode: minimum |d2| gate ---
+        # d2 is the vol-adjusted distance (in standard deviations) between the
+        # live price and the strike.  When |d2| < arb_min_d2 (default 1.1), even
+        # a small adverse move can swing fair probability by 20–30 points and
+        # trigger a stop-loss exit at a loss.  This scales with both asset
+        # volatility and time remaining — a flat %-distance check does not.
+        if not is_snipe and config.STRATEGY.arb_min_d2 > 0.0:
+            T_arb   = max(t_rem, 1.0) / (365.25 * 24.0 * 3600.0)
+            sqt_arb = vol * math.sqrt(T_arb)
+            if sqt_arb > 0:
+                d2_abs = abs(
+                    (math.log(consensus / market.strike_price) - 0.5 * vol**2 * T_arb)
+                    / sqt_arb
+                )
+                if d2_abs < config.STRATEGY.arb_min_d2:
+                    log.debug(
+                        "%s %s arb: |d2|=%.3f < min %.2f — too close to strike in vol-adjusted space",
+                        symbol, cid[:8], d2_abs, config.STRATEGY.arb_min_d2,
+                    )
+                    return
+
         # --- 6. Edge calculation ---
         edge_up   = p_up   - up_mid
         edge_down = p_down - down_mid
