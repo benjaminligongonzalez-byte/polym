@@ -48,6 +48,7 @@ DEFAULT_VOL    = 1.00
 HOUSE_SPREAD   = 0.02
 
 ARB_EDGE       = 0.05
+ARB_MIN_PROB   = 0.65      # minimum fair probability for any ARB entry
 SNIPE_WINDOW   = 300.0     # seconds — activate in final 5 min
 SNIPE_MIN_PROB = 0.75      # minimum fair probability in sniper mode
 SNIPE_EDGE     = 0.03      # lower edge bar (near-certain outcome)
@@ -400,9 +401,13 @@ def evaluate(
             bet, token_side = "Down", "down"
             fair, mkt_p, edge = p_down, down_mid, edge_down
     elif edge_up >= edge_down:
+        if p_up < ARB_MIN_PROB:
+            return None   # low conviction — skip (fair prob < 65%)
         bet, token_side = "Up",   "up"
         fair, mkt_p, edge = p_up,   up_mid,   edge_up
     else:
+        if p_down < ARB_MIN_PROB:
+            return None   # low conviction — skip (fair prob < 65%)
         bet, token_side = "Down", "down"
         fair, mkt_p, edge = p_down, down_mid, edge_down
 
@@ -708,7 +713,19 @@ def run(args: argparse.Namespace) -> None:
             trade = evaluate(sym, cid, strike, t_rem, live_px, up_mid, wallet, cooldowns, sim_now)
 
             if trade is None:
-                reason = "no edge" if max(edge_u, edge_d) < threshold else "confidence gate"
+                best = max(edge_u, edge_d)
+                best_fair = max(
+                    p_up if edge_u >= edge_d else 0.0,
+                    p_down if edge_d > edge_u else 0.0
+                )
+                if best < threshold:
+                    reason = "no edge"
+                elif is_snipe and max(p_up, p_down) < SNIPE_MIN_PROB:
+                    reason = "confidence gate"
+                elif not is_snipe and best_fair < ARB_MIN_PROB:
+                    reason = f"low conviction (fair={best_fair:.2f}<{ARB_MIN_PROB})"
+                else:
+                    reason = "confidence gate"
                 print(f"      {DIM}↳ no trade ({reason}){RESET}")
                 continue
 

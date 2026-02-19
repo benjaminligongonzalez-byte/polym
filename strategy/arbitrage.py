@@ -289,6 +289,15 @@ class ArbStrategy:
                     is_snipe=True,
                 )
         elif edge_up >= edge_down:
+            # ARB conviction gate: require minimum fair probability.
+            # Rejects coin-flip bets (~55%) and cheap-option longshots (~7%)
+            # that have statistical edge but lack real directional conviction.
+            if p_up < config.STRATEGY.arb_min_fair_prob:
+                log.debug(
+                    "%s %s arb: Up fair=%.3f < arb_min=%.3f — skip (low conviction)",
+                    symbol, cid[:8], p_up, config.STRATEGY.arb_min_fair_prob,
+                )
+                return
             sig = ArbSignal(
                 market=market,
                 token_id=market.up_token.token_id,
@@ -303,6 +312,12 @@ class ArbStrategy:
                 is_snipe=False,
             )
         else:
+            if p_down < config.STRATEGY.arb_min_fair_prob:
+                log.debug(
+                    "%s %s arb: Down fair=%.3f < arb_min=%.3f — skip (low conviction)",
+                    symbol, cid[:8], p_down, config.STRATEGY.arb_min_fair_prob,
+                )
+                return
             sig = ArbSignal(
                 market=market,
                 token_id=market.down_token.token_id,

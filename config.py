@@ -125,6 +125,13 @@ class StrategyConfig:
     # e.g. 0.05 = we only trade when Polymarket is >5 cents wrong.
     arb_edge_threshold: float = 0.05
 
+    # Minimum fair probability on the chosen bet side for ARB mode.
+    # e.g. 0.65 = only trade when our model says ≥65% chance of winning.
+    # Filters out cheap-option longshots (7% win) and coin-flip arb (55% win).
+    # Only enter when price has moved enough to give real directional conviction.
+    # Sniper mode has its own separate gate (snipe_min_fair_prob, default 0.75).
+    arb_min_fair_prob: float = 0.65
+
     # How often (seconds) to scan all markets for arb opportunities
     arb_scan_interval: float = 2.0
 
