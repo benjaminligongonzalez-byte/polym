@@ -132,6 +132,28 @@ class StrategyConfig:
     # 0.25 = quarter Kelly (conservative; good starting point).
     kelly_fraction: float = 0.25
 
+    # ---- Late-window sniper mode ----
+    # The target strategy: only bet in the final minutes when the outcome
+    # is nearly certain but Polymarket prices haven't fully caught up yet.
+    #
+    # Example: 2 min left, BTC clearly past strike → fair_prob = 0.93,
+    # Polymarket still shows 0.75 → edge = 0.18, near-certain win.
+    #
+    # Activate sniper mode when time remaining < snipe_window_secs.
+    snipe_window_secs: float = 300.0     # final 5 minutes of the window
+
+    # Only fire in sniper mode when our fair probability is this high.
+    # Below this threshold the outcome is still too uncertain — skip it.
+    snipe_min_fair_prob: float = 0.75    # ≥75% confident the bet wins
+
+    # Minimum edge in sniper mode (lower than arb_edge_threshold because
+    # a near-certain bet needs only a small margin over the house spread).
+    snipe_edge_threshold: float = 0.03
+
+    # More aggressive Kelly multiplier in sniper mode — we're near-certain,
+    # so it's correct to size up relative to the early-window arb mode.
+    snipe_kelly_fraction: float = 0.50   # half-Kelly on near-locks
+
     # ---- Shared ----
     # Maximum open positions at once per symbol
     max_open_positions: int = 3

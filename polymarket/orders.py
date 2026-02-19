@@ -232,21 +232,31 @@ class OrderManager:
 
     async def execute_arb_signal(self, sig: "ArbSignal") -> None:
         """
-        Arb signal: execute using fractional Kelly sizing vs wallet balance.
+        Arb/Snipe signal: execute using fractional Kelly sizing vs wallet balance.
 
-            kelly_usdc = sig.kelly_f × config.STRATEGY.kelly_fraction × wallet_balance
-            order_usdc = clamp(kelly_usdc, min_order_usdc, max_order_usdc)
+        Sniper mode uses a higher Kelly multiplier because the bet is near-certain:
+            kelly_usdc = sig.kelly_f × snipe_kelly_fraction × wallet_balance
+
+        Standard arb mode uses the conservative default:
+            kelly_usdc = sig.kelly_f × kelly_fraction × wallet_balance
+
+        order_usdc = clamp(kelly_usdc, min_order_usdc, max_order_usdc)
         """
         cid = sig.market.condition_id
 
         if self._on_cooldown(cid):
-            log.debug("Market %s on cooldown (arb).", cid[:8])
+            log.debug("Market %s on cooldown (%s).", cid[:8], "snipe" if sig.is_snipe else "arb")
             return
 
         if not self._risk_ok(sig.symbol):
             return
 
-        kelly_usdc = sig.kelly_f * config.STRATEGY.kelly_fraction * self._wallet_balance
+        kelly_mult = (
+            config.STRATEGY.snipe_kelly_fraction
+            if sig.is_snipe
+            else config.STRATEGY.kelly_fraction
+        )
+        kelly_usdc = sig.kelly_f * kelly_mult * self._wallet_balance
         order_usdc = max(
             config.RISK.min_order_usdc,
             min(kelly_usdc, self._max_order_usdc, self._remaining_budget()),
@@ -254,6 +264,7 @@ class OrderManager:
         if order_usdc < config.RISK.min_order_usdc:
             return
 
+        mode = "SNIPE" if sig.is_snipe else "ARB"
         await self._place_order(
             cid=cid,
             token_id=sig.token_id,
@@ -261,7 +272,10 @@ class OrderManager:
             mid=sig.market_prob,
             order_usdc=order_usdc,
             question=sig.market.question,
-            source=f"ARB edge={sig.edge:.3f} kelly={sig.kelly_f:.3f} wallet=${self._wallet_balance:.0f}",
+            source=(
+                f"{mode} fair={sig.fair_prob:.3f} edge={sig.edge:.3f}"
+                f" kelly={sig.kelly_f:.3f}×{kelly_mult} wallet=${self._wallet_balance:.0f}"
+            ),
         )
 
     # ------------------------------------------------------------------

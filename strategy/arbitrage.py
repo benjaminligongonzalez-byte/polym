@@ -114,6 +114,7 @@ class ArbSignal:
     symbol: str
     consensus_price: float
     strike_price: float
+    is_snipe: bool = False  # True when fired in late-window sniper mode
 
 
 ArbCallback = Callable[["ArbSignal"], Awaitable[None]]
@@ -180,6 +181,14 @@ class ArbStrategy:
         if t_rem <= 0 or t_rem > 930:
             return
 
+        # --- 3b. Select mode: sniper (final minutes) vs standard arb ---
+        is_snipe = t_rem < config.STRATEGY.snipe_window_secs
+        threshold = (
+            config.STRATEGY.snipe_edge_threshold
+            if is_snipe
+            else config.STRATEGY.arb_edge_threshold
+        )
+
         # --- 4. Fetch live Polymarket prices for both tokens ---
         try:
             up_mid = await self._pm_client.get_midpoint(market.up_token.token_id)
@@ -193,20 +202,31 @@ class ArbStrategy:
         p_up   = fair_prob_up(consensus, market.strike_price, t_rem, vol)
         p_down = 1.0 - p_up
 
+        # --- 5b. Sniper confidence gate ---
+        # In sniper mode we only act when the outcome is near-certain.
+        # This is the core of the "all winners" strategy: only bet when
+        # fair probability is already very high (price far past the strike).
+        if is_snipe and max(p_up, p_down) < config.STRATEGY.snipe_min_fair_prob:
+            log.debug(
+                "%s %s sniper: max_fair=%.3f < min_fair=%.3f (not certain enough)",
+                symbol, cid[:8], max(p_up, p_down), config.STRATEGY.snipe_min_fair_prob,
+            )
+            return
+
         # --- 6. Edge calculation ---
         edge_up   = p_up   - up_mid
         edge_down = p_down - down_mid
 
-        threshold = config.STRATEGY.arb_edge_threshold
         best_edge = max(edge_up, edge_down)
 
         if best_edge < threshold:
             log.debug(
                 "%s %s | p_up=%.3f up_mkt=%.3f e_up=%.3f"
-                "  p_dn=%.3f dn_mkt=%.3f e_dn=%.3f (no edge)",
+                "  p_dn=%.3f dn_mkt=%.3f e_dn=%.3f (no edge, mode=%s)",
                 symbol, cid[:8],
                 p_up, up_mid, edge_up,
                 p_down, down_mid, edge_down,
+                "snipe" if is_snipe else "arb",
             )
             return
 
@@ -223,6 +243,7 @@ class ArbStrategy:
                 symbol=symbol,
                 consensus_price=consensus,
                 strike_price=market.strike_price,
+                is_snipe=is_snipe,
             )
         else:
             sig = ArbSignal(
@@ -236,6 +257,7 @@ class ArbStrategy:
                 symbol=symbol,
                 consensus_price=consensus,
                 strike_price=market.strike_price,
+                is_snipe=is_snipe,
             )
 
         await self._maybe_emit(sig)
@@ -253,11 +275,11 @@ class ArbStrategy:
             for s, p in src.items()
         )
 
-        # "ARB XRP  live=1.4220  strike=1.4208 → buy Down
-        #      fair=0.485  mkt=0.400  edge=0.085  kelly=0.142  t_rem=773s"
+        mode = "SNIPE" if sig.is_snipe else "ARB"
         log.info(
-            "ARB  %-3s  live=%.4f  strike=%.4f  buy=%-4s"
+            "%s %-3s  live=%.4f  strike=%.4f  buy=%-4s"
             "  fair=%.3f  mkt=%.3f  edge=%.3f  kelly=%.3f  t_rem=%.0fs  [%s]",
+            mode,
             sig.symbol, sig.consensus_price, sig.strike_price, sig.bet,
             sig.fair_prob, sig.market_prob, sig.edge, sig.kelly_f,
             sig.market.time_remaining_secs, src_str,
