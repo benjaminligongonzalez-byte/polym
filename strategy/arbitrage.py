@@ -238,8 +238,57 @@ class ArbStrategy:
             )
             return
 
-        # Pick the better bet
-        if edge_up >= edge_down:
+        # Pick which side to bet.
+        #
+        # Sniper mode: ONLY bet the high-probability (near-certain) side.
+        # The whole point is to ride the information lag — BTC moved up, so we
+        # buy Up before Polymarket reprices it.  Betting the cheap low-prob side
+        # (Down at 2¢ when Up should win 90%) is pure stat-arb and almost always
+        # loses.  If the near-certain side no longer has edge, skip entirely.
+        #
+        # Standard ARB mode: pick whichever side has more edge (normal arbitrage).
+        if is_snipe:
+            if p_up >= p_down:
+                if edge_up < threshold:
+                    log.debug(
+                        "%s %s sniper: near-certain side (Up) has no edge (%.3f < %.3f) — skip",
+                        symbol, cid[:8], edge_up, threshold,
+                    )
+                    return
+                sig = ArbSignal(
+                    market=market,
+                    token_id=market.up_token.token_id,
+                    bet="Up",
+                    fair_prob=p_up,
+                    market_prob=up_mid,
+                    edge=edge_up,
+                    kelly_f=kelly_fraction(p_up, up_mid),
+                    symbol=symbol,
+                    consensus_price=consensus,
+                    strike_price=market.strike_price,
+                    is_snipe=True,
+                )
+            else:
+                if edge_down < threshold:
+                    log.debug(
+                        "%s %s sniper: near-certain side (Down) has no edge (%.3f < %.3f) — skip",
+                        symbol, cid[:8], edge_down, threshold,
+                    )
+                    return
+                sig = ArbSignal(
+                    market=market,
+                    token_id=market.down_token.token_id,
+                    bet="Down",
+                    fair_prob=p_down,
+                    market_prob=down_mid,
+                    edge=edge_down,
+                    kelly_f=kelly_fraction(p_down, down_mid),
+                    symbol=symbol,
+                    consensus_price=consensus,
+                    strike_price=market.strike_price,
+                    is_snipe=True,
+                )
+        elif edge_up >= edge_down:
             sig = ArbSignal(
                 market=market,
                 token_id=market.up_token.token_id,
@@ -251,7 +300,7 @@ class ArbStrategy:
                 symbol=symbol,
                 consensus_price=consensus,
                 strike_price=market.strike_price,
-                is_snipe=is_snipe,
+                is_snipe=False,
             )
         else:
             sig = ArbSignal(
@@ -265,7 +314,7 @@ class ArbStrategy:
                 symbol=symbol,
                 consensus_price=consensus,
                 strike_price=market.strike_price,
-                is_snipe=is_snipe,
+                is_snipe=False,
             )
 
         await self._maybe_emit(sig)

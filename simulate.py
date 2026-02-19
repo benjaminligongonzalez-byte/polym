@@ -386,7 +386,20 @@ def evaluate(
     if (sim_now_ref - cooldowns.get(cid, 0.0)) < COOLDOWN:
         return None
 
-    if edge_up >= edge_down:
+    # Sniper mode: ONLY bet the high-probability (near-certain) side.
+    # Standard ARB: pick whichever side has more edge.
+    if is_snipe:
+        if p_up >= p_down:
+            if edge_up < threshold:
+                return None   # near-certain side (Up) already fully priced — skip
+            bet, token_side = "Up", "up"
+            fair, mkt_p, edge = p_up, up_mid, edge_up
+        else:
+            if edge_down < threshold:
+                return None   # near-certain side (Down) already fully priced — skip
+            bet, token_side = "Down", "down"
+            fair, mkt_p, edge = p_down, down_mid, edge_down
+    elif edge_up >= edge_down:
         bet, token_side = "Up",   "up"
         fair, mkt_p, edge = p_up,   up_mid,   edge_up
     else:
