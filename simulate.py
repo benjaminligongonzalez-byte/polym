@@ -886,7 +886,7 @@ def run(args: argparse.Namespace) -> None:
         if args.demo and all(m["t_rem"] <= 0 for m in markets) and not open_pos:
             break
 
-        if cycle < args.cycles:
+        if not args.demo and cycle < args.cycles:
             time.sleep(args.interval)
 
     # ── Final summary ─────────────────────────────────────────────────────────
