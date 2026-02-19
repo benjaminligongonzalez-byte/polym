@@ -1,5 +1,5 @@
 """
-Central configuration for the Polymarket momentum trading bot.
+Central configuration for the Polymarket momentum + arbitrage trading bot.
 
 All tuneable parameters live here so nothing is scattered across files.
 """
@@ -36,7 +36,6 @@ PAPER_TRADE: bool = os.environ.get("PAPER_TRADE", "false").lower() == "true"
 # Market filter — which Polymarket markets to trade
 # ---------------------------------------------------------------------------
 # Keywords found in the market question for 15-min crypto up/down bets.
-# Polymarket typically phrases them as "Will BTC be higher 15 minutes from now?"
 MARKET_KEYWORDS: list[str] = [
     "higher 15 minutes",
     "lower 15 minutes",
@@ -44,13 +43,12 @@ MARKET_KEYWORDS: list[str] = [
     "down in 15",
 ]
 
-# Crypto symbols we care about (Polymarket uses these in question text)
+# Crypto symbols we care about (must match text found in Polymarket questions)
 TARGET_SYMBOLS: list[str] = ["BTC", "ETH"]
 
 # ---------------------------------------------------------------------------
 # Binance WebSocket price feed
 # ---------------------------------------------------------------------------
-# Streams: <symbol>@trade  gives every trade in real time (fastest feed)
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
 BINANCE_STREAMS: list[str] = ["btcusdt@trade", "ethusdt@trade"]
 
@@ -61,46 +59,79 @@ STREAM_SYMBOL_MAP: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Coinbase Exchange WebSocket price feed
+# ---------------------------------------------------------------------------
+# Uses the legacy Coinbase Exchange WS (no auth required for ticker)
+COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
+COINBASE_PRODUCTS: list[str] = ["BTC-USD", "ETH-USD"]
+
+# Mapping from Coinbase product → our canonical symbol
+COINBASE_SYMBOL_MAP: dict[str, str] = {
+    "BTC-USD": "BTC",
+    "ETH-USD": "ETH",
+}
+
+# ---------------------------------------------------------------------------
+# Volatility model
+# ---------------------------------------------------------------------------
+# Annualised historical volatility used in the log-normal fair-value model.
+# These are rough estimates; tune them to recent realised vol.
+# BTC: ~80–100% annualised; ETH: ~90–110% annualised (as of 2025 levels)
+VOLATILITY: dict[str, float] = {
+    "BTC": 0.90,   # 90% annualised vol
+    "ETH": 1.00,   # 100% annualised vol
+}
+DEFAULT_ANNUAL_VOL: float = 0.90   # fallback for unlisted symbols
+
+# ---------------------------------------------------------------------------
 # Strategy parameters
 # ---------------------------------------------------------------------------
 @dataclass
 class StrategyConfig:
-    # % price move on Binance that triggers a trade signal (e.g. 0.10 = 0.10%)
+    # ---- Momentum sub-strategy (speed layer) ----
+    # % price move that triggers a momentum trade signal (e.g. 0.10 = 0.10%)
     trigger_pct: float = 0.10
 
-    # Lookback window (seconds) over which we measure the price move
+    # Lookback window (seconds) over which we measure the move
     lookback_secs: float = 5.0
 
-    # Minimum Polymarket probability for a YES token before we'll buy YES
-    # (avoid buying when market already fully priced in the move)
+    # Probability bounds — don't bet if market price is already extreme
     min_yes_prob: float = 0.10
     max_yes_prob: float = 0.90
 
-    # Same bounds for NO
-    min_no_prob: float = 0.10
-    max_no_prob: float = 0.90
+    # ---- Arbitrage sub-strategy (edge layer) ----
+    # Minimum fair-value edge (in probability points) before we act.
+    # e.g. 0.05 = we only trade when Polymarket is >5 cents wrong.
+    arb_edge_threshold: float = 0.05
 
-    # Maximum number of open (unresolved) positions at once per symbol
+    # How often (seconds) to scan all markets for arb opportunities
+    arb_scan_interval: float = 2.0
+
+    # Fractional Kelly multiplier applied to the full-Kelly bet size.
+    # 0.25 = quarter Kelly (conservative; good starting point).
+    kelly_fraction: float = 0.25
+
+    # ---- Shared ----
+    # Maximum open positions at once per symbol
     max_open_positions: int = 3
 
-    # Cooldown (seconds) after firing a trade before we can fire again
-    # on the same market — prevents hammering on a single window
+    # Cooldown (seconds) after firing a trade on the same market
     trade_cooldown_secs: float = 30.0
 
 
 @dataclass
 class RiskConfig:
-    # Maximum USDC to spend per order
+    # Maximum USDC to spend on a single order
     max_order_usdc: float = 20.0
 
-    # Minimum order size (below this we skip — not worth fees)
+    # Minimum order (below this we skip — not worth fees / slippage)
     min_order_usdc: float = 2.0
 
-    # Maximum total USDC deployed across all open positions
+    # Hard cap on total USDC deployed across all open positions
     max_total_exposure_usdc: float = 200.0
 
-    # Slippage tolerance: how far from mid we'll accept (fraction of price)
-    # e.g. 0.03 means we'll pay up to 3 cents more than current best ask
+    # How far above mid-price we'll bid (aggressive taker)
+    # e.g. 0.03 = pay up to 3 cents above current best ask
     slippage_tolerance: float = 0.03
 
 

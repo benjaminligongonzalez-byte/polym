@@ -18,6 +18,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
@@ -43,17 +44,36 @@ class MarketInfo:
     question: str
     symbol: str                     # "BTC" or "ETH"
     direction: str                  # "UP" or "DOWN"
-    end_date_iso: str               # ISO 8601 string
+    end_date_iso: str               # ISO 8601 close time string
     yes_token: TokenInfo
     no_token: TokenInfo
     # Cached mid prices (updated on each refresh)
     yes_mid: float = 0.5
     no_mid: float = 0.5
     last_refresh: float = field(default_factory=time.monotonic)
+    # Strike price: the live crypto price recorded when we first discovered
+    # this market window. Used by the arb strategy as the reference price.
+    strike_price: Optional[float] = None
 
     @property
     def is_stale(self) -> bool:
         return (time.monotonic() - self.last_refresh) > 10.0
+
+    @property
+    def time_remaining_secs(self) -> float:
+        """
+        Seconds until the market closes (negative if already closed).
+        Parses end_date_iso as UTC; falls back to 0 on parse error.
+        """
+        if not self.end_date_iso:
+            return 0.0
+        try:
+            end = datetime.fromisoformat(
+                self.end_date_iso.replace("Z", "+00:00")
+            )
+            return (end - datetime.now(timezone.utc)).total_seconds()
+        except (ValueError, TypeError):
+            return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +112,7 @@ class MarketCache:
     """
     Maintains a live list of MarketInfo objects for active 15-min crypto markets.
 
-    Call refresh() to fetch from Gamma API.
+    Call start() once at bot startup (fetches initial market list).
     Markets are keyed by condition_id.
     """
 
@@ -121,10 +141,11 @@ class MarketCache:
             new_cache: dict[str, MarketInfo] = {}
             for m in markets:
                 if m.condition_id in self._markets:
-                    # Preserve existing pricing
+                    # Preserve mutable state from existing entry
                     existing = self._markets[m.condition_id]
                     m.yes_mid = existing.yes_mid
                     m.no_mid = existing.no_mid
+                    m.strike_price = existing.strike_price  # keep recorded strike
                 new_cache[m.condition_id] = m
             self._markets = new_cache
             self._last_full_refresh = time.monotonic()
