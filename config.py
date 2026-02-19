@@ -35,31 +35,40 @@ PAPER_TRADE: bool = os.environ.get("PAPER_TRADE", "false").lower() == "true"
 # ---------------------------------------------------------------------------
 # Market filter — which Polymarket markets to trade
 # ---------------------------------------------------------------------------
-# Keywords that identify 15-min crypto up/down bet markets.
-# Polymarket uses multiple phrasings — cover them all.
-# Each entry must appear in the question text (case-insensitive).
+# Keywords that identify 15-min crypto Up/Down bet markets.
+# The primary live format is "XRP Up or Down - 15 Minutes".
+# Legacy phrasings are kept for backward compatibility.
 MARKET_KEYWORDS: list[str] = [
-    "higher 15 minutes",
-    "lower 15 minutes",
-    "up in 15",
-    "down in 15",
-    "above $",          # "Will BTC be above $84,500 at ..."
-    "below $",          # "Will BTC be below $3,200 at ..."
+    "up or down - 15",      # "XRP Up or Down - 15 Minutes"  ← primary format
+    "up or down - 15 min",  # variant
+    "higher 15 minutes",    # legacy
+    "lower 15 minutes",     # legacy
+    "up in 15",             # legacy
+    "down in 15",           # legacy
+    "above $",              # legacy "Will BTC be above $84,500 …"
+    "below $",              # legacy
 ]
 
-# Crypto symbols we care about (must match text found in Polymarket questions)
-TARGET_SYMBOLS: list[str] = ["BTC", "ETH"]
+# Crypto symbols we trade (must match text in Polymarket market titles)
+TARGET_SYMBOLS: list[str] = ["BTC", "ETH", "XRP", "SOL"]
 
 # ---------------------------------------------------------------------------
 # Binance WebSocket price feed
 # ---------------------------------------------------------------------------
 BINANCE_WS_BASE = "wss://stream.binance.com:9443/stream?streams="
-BINANCE_STREAMS: list[str] = ["btcusdt@trade", "ethusdt@trade"]
+BINANCE_STREAMS: list[str] = [
+    "btcusdt@trade",
+    "ethusdt@trade",
+    "xrpusdt@trade",
+    "solusdt@trade",
+]
 
 # Mapping from Binance stream symbol → our canonical symbol
 STREAM_SYMBOL_MAP: dict[str, str] = {
     "btcusdt": "BTC",
     "ethusdt": "ETH",
+    "xrpusdt": "XRP",
+    "solusdt": "SOL",
 }
 
 # ---------------------------------------------------------------------------
@@ -67,12 +76,14 @@ STREAM_SYMBOL_MAP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # Uses the legacy Coinbase Exchange WS (no auth required for ticker)
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
-COINBASE_PRODUCTS: list[str] = ["BTC-USD", "ETH-USD"]
+COINBASE_PRODUCTS: list[str] = ["BTC-USD", "ETH-USD", "XRP-USD", "SOL-USD"]
 
 # Mapping from Coinbase product → our canonical symbol
 COINBASE_SYMBOL_MAP: dict[str, str] = {
     "BTC-USD": "BTC",
     "ETH-USD": "ETH",
+    "XRP-USD": "XRP",
+    "SOL-USD": "SOL",
 }
 
 # ---------------------------------------------------------------------------
@@ -82,10 +93,16 @@ COINBASE_SYMBOL_MAP: dict[str, str] = {
 # These are rough estimates; tune them to recent realised vol.
 # BTC: ~80–100% annualised; ETH: ~90–110% annualised (as of 2025 levels)
 VOLATILITY: dict[str, float] = {
-    "BTC": 0.90,   # 90% annualised vol
-    "ETH": 1.00,   # 100% annualised vol
+    "BTC": 0.90,   # ~90% annualised vol
+    "ETH": 1.00,   # ~100%
+    "XRP": 1.20,   # ~120% — higher vol than BTC/ETH
+    "SOL": 1.30,   # ~130%
 }
-DEFAULT_ANNUAL_VOL: float = 0.90   # fallback for unlisted symbols
+DEFAULT_ANNUAL_VOL: float = 1.00   # fallback for unlisted symbols
+
+# House spread baked into Polymarket prices (Up + Down sum to ~$1.02).
+# Our edge threshold must exceed this to be profitable after the spread.
+HOUSE_SPREAD: float = 0.02
 
 # ---------------------------------------------------------------------------
 # Strategy parameters
@@ -125,18 +142,34 @@ class StrategyConfig:
 
 @dataclass
 class RiskConfig:
-    # Maximum USDC to spend on a single order
-    max_order_usdc: float = 20.0
+    # ------------------------------------------------------------------
+    # Wallet-proportional sizing
+    # The bot fetches the real USDC balance at startup and every
+    # balance_refresh_secs thereafter.  All limits scale with the wallet.
+    # ------------------------------------------------------------------
 
-    # Minimum order (below this we skip — not worth fees / slippage)
+    # Max USDC to risk on a single order as a fraction of wallet balance.
+    # e.g. 0.05 = never bet more than 5% of your wallet on one trade.
+    max_order_fraction: float = 0.05
+
+    # Maximum total USDC deployed across all open positions at once,
+    # as a fraction of wallet balance.
+    # e.g. 0.20 = never have more than 20% of wallet exposed simultaneously.
+    max_exposure_fraction: float = 0.20
+
+    # Hard ceiling on a single order regardless of wallet size.
+    # Prevents runaway bets on large wallets.
+    max_order_usdc_hard: float = 50.0
+
+    # Minimum order (below this skip — not worth the fee).
     min_order_usdc: float = 2.0
 
-    # Hard cap on total USDC deployed across all open positions
-    max_total_exposure_usdc: float = 200.0
-
-    # How far above mid-price we'll bid (aggressive taker)
-    # e.g. 0.03 = pay up to 3 cents above current best ask
+    # How far above mid-price we'll bid (aggressive taker).
+    # e.g. 0.03 = pay up to 3 cents more than current best ask.
     slippage_tolerance: float = 0.03
+
+    # How often (seconds) to re-fetch the wallet USDC balance.
+    balance_refresh_secs: float = 30.0
 
 
 STRATEGY = StrategyConfig()

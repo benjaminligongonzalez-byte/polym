@@ -159,6 +159,9 @@ class Bot:
         # 6. Launch background tasks
         self._tasks = [
             asyncio.create_task(
+                self._order_manager.run_balance_refresh_loop(), name="balance-refresh"
+            ),
+            asyncio.create_task(
                 self._market_cache.run_refresh_loop(), name="market-refresh"
             ),
             asyncio.create_task(
@@ -174,7 +177,7 @@ class Bot:
             )
 
         log.info(
-            "Bot running with %d tasks. Binance + Coinbase feeds active. "
+            "Bot running with %d tasks. Feeds: Binance+Coinbase (BTC/ETH/XRP/SOL). "
             "Press Ctrl+C to stop.",
             len(self._tasks),
         )

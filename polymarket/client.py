@@ -114,6 +114,23 @@ class PolymarketClient:
         resp = await self._run(self._client.get_spread, token_id)
         return {k: float(v) for k, v in resp.items()}
 
+    async def get_usdc_balance(self) -> float:
+        """
+        Return the USDC balance available in the trading wallet (in USDC, not wei).
+
+        Queries the CLOB's balance-allowance endpoint.
+        USDC on Polygon uses 6 decimal places, so raw balance is divided by 1e6.
+        """
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            resp = await self._run(self._client.get_balance_allowance, params)
+            raw = resp.get("balance", "0")
+            return float(raw) / 1_000_000
+        except Exception as exc:
+            log.warning("Could not fetch USDC balance: %s", exc)
+            return 0.0
+
     # ------------------------------------------------------------------
     # Order placement
     # ------------------------------------------------------------------

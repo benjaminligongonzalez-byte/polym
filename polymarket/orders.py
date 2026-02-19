@@ -1,20 +1,37 @@
 """
-Order sizing and execution logic.
+Order sizing and execution.
 
-Handles two kinds of signals:
+Bet sizing strategy
+-------------------
+All sizing is proportional to the **live USDC wallet balance**, fetched at
+startup and refreshed every config.RISK.balance_refresh_secs seconds.
 
-1. Momentum signals  (execute_signal)
-   Simple directional momentum: price moved X%, bet accordingly.
-   Uses flat order sizing (max_order_usdc).
+Per-order size (flat momentum bets):
+    order_usdc = min(
+        wallet_balance * max_order_fraction,   # e.g. 5% of wallet
+        max_order_usdc_hard,                   # hard cap regardless of size
+        remaining_budget,                      # what's still undeployed
+    )
 
-2. Arbitrage signals  (execute_arb_signal)
-   Fair-value edge detected: Polymarket price differs from our model by
-   more than the threshold.  Uses fractional Kelly sizing based on the
-   computed edge and full-Kelly fraction stored in the ArbSignal.
+Per-order size (arb bets with Kelly sizing):
+    kelly_usdc = kelly_f * kelly_fraction * wallet_balance
+    order_usdc = max(min_order_usdc, min(kelly_usdc, flat_order_usdc))
+
+Total exposure cap:
+    max_deployed = wallet_balance * max_exposure_fraction   # e.g. 20%
+
+Example with $500 wallet:
+    max_order  = min($500*0.05, $50) = $25 per bet
+    max_deploy = $500*0.20 = $100 total across all open positions
+    Kelly arb  = kelly_f * 0.25 * $500 — capped at $25
+
+This prevents blowing the bank: even if every trade loses, the most
+you can lose per cycle is max_order_fraction of your balance.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -31,16 +48,76 @@ log = logging.getLogger(__name__)
 
 class OrderManager:
     """
-    Handles order sizing and tracks open positions for risk control.
+    Manages order sizing, placement, and position tracking.
+
+    Wallet balance is fetched at startup and kept fresh via
+    run_balance_refresh_loop().
     """
 
     def __init__(self, client: PolymarketClient, cache: MarketCache) -> None:
         self._client = client
         self._cache = cache
+        self._wallet_balance: float = 0.0          # live USDC balance
+        self._last_balance_log: float = 0.0
         # condition_id → last trade timestamp (monotonic)
         self._last_trade: dict[str, float] = {}
         # condition_id → USDC currently deployed
         self._open_exposure: dict[str, float] = {}
+
+    # ------------------------------------------------------------------
+    # Wallet balance management
+    # ------------------------------------------------------------------
+
+    async def refresh_balance(self) -> None:
+        """Fetch live USDC balance and cache it."""
+        balance = await self._client.get_usdc_balance()
+        changed = abs(balance - self._wallet_balance) > 0.01
+        self._wallet_balance = balance
+        # Log balance changes and periodically as a heartbeat
+        now = time.monotonic()
+        if changed or now - self._last_balance_log > 300:
+            log.info(
+                "Wallet balance: $%.2f USDC  |  deployed: $%.2f  |  "
+                "available: $%.2f  |  max_order: $%.2f  |  max_exposure: $%.2f",
+                self._wallet_balance,
+                self.total_exposure,
+                self._available_balance,
+                self._max_order_usdc,
+                self._max_exposure_usdc,
+            )
+            self._last_balance_log = now
+
+    async def run_balance_refresh_loop(self) -> None:
+        """Background task: keep wallet balance fresh."""
+        await self.refresh_balance()          # immediate fetch on start
+        while True:
+            await asyncio.sleep(config.RISK.balance_refresh_secs)
+            await self.refresh_balance()
+
+    # ------------------------------------------------------------------
+    # Derived sizing limits
+    # ------------------------------------------------------------------
+
+    @property
+    def _available_balance(self) -> float:
+        """USDC balance minus what's already deployed."""
+        return max(0.0, self._wallet_balance - self.total_exposure)
+
+    @property
+    def _max_exposure_usdc(self) -> float:
+        return self._wallet_balance * config.RISK.max_exposure_fraction
+
+    @property
+    def _max_order_usdc(self) -> float:
+        """Per-order cap: fraction of wallet, hard ceiling applied."""
+        return min(
+            self._wallet_balance * config.RISK.max_order_fraction,
+            config.RISK.max_order_usdc_hard,
+        )
+
+    def _remaining_budget(self) -> float:
+        """How much more USDC we can deploy before hitting the exposure cap."""
+        return max(0.0, self._max_exposure_usdc - self.total_exposure)
 
     # ------------------------------------------------------------------
     # Risk helpers
@@ -61,8 +138,21 @@ class OrderManager:
         )
         return count >= config.STRATEGY.max_open_positions
 
-    def _remaining_budget(self) -> float:
-        return config.RISK.max_total_exposure_usdc - self.total_exposure
+    def _risk_ok(self, symbol: str) -> bool:
+        """Combined pre-trade risk gate."""
+        if self._wallet_balance < config.RISK.min_order_usdc:
+            log.warning("Wallet balance $%.2f too low to trade.", self._wallet_balance)
+            return False
+        if self.total_exposure >= self._max_exposure_usdc:
+            log.warning(
+                "Exposure cap reached: $%.2f / $%.2f",
+                self.total_exposure, self._max_exposure_usdc,
+            )
+            return False
+        if self._too_many_positions(symbol):
+            log.warning("Too many open positions for %s.", symbol)
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Momentum signal handler
@@ -75,69 +165,60 @@ class OrderManager:
         price_move_pct: float,
     ) -> None:
         """
-        Given a confirmed momentum signal, find matching markets and place orders.
-
-        direction="UP"   → buy YES on "higher" markets, NO on "lower" markets
-        direction="DOWN" → buy YES on "lower" markets,  NO on "higher" markets
+        Momentum signal: price moved fast, find matching markets and bet.
+        direction="UP"   → buy Up token
+        direction="DOWN" → buy Down token
         """
-        log.info("MOMENTUM  %s  %s  %.3f%%", symbol, direction, price_move_pct)
+        log.info("MOMENTUM  %-3s  %s  %.3f%%", symbol, direction, price_move_pct)
 
-        if self.total_exposure >= config.RISK.max_total_exposure_usdc:
-            log.warning("Total exposure cap reached ($%.2f). Skipping.", self.total_exposure)
+        if not self._risk_ok(symbol):
             return
 
-        if self._too_many_positions(symbol):
-            log.warning("Too many open positions for %s. Skipping.", symbol)
+        markets = self._cache.get_markets_for_symbol(symbol)
+        if not markets:
+            log.debug("No markets found for %s.", symbol)
             return
 
-        target_markets = self._cache.get_markets_for(symbol, direction)
-        if not target_markets:
-            log.debug("No matching markets for %s %s.", symbol, direction)
-            return
+        for market in markets:
+            await self._trade_momentum(market, direction)
 
-        for market in target_markets:
-            await self._trade_market(market, direction)
-
-    async def _trade_market(self, market: MarketInfo, signal_direction: str) -> None:
+    async def _trade_momentum(self, market: MarketInfo, direction: str) -> None:
         cid = market.condition_id
-
         if self._on_cooldown(cid):
-            log.debug("Market %s on cooldown.", cid[:8])
             return
 
-        # Fetch live mid price
-        try:
-            yes_mid = await self._client.get_midpoint(market.yes_token.token_id)
-        except Exception as exc:
-            log.warning("Could not fetch mid for %s: %s", cid[:8], exc)
-            return
-
-        no_mid = 1.0 - yes_mid
-
-        if signal_direction == market.direction:
-            token_id = market.yes_token.token_id
-            mid = yes_mid
-            token_label = "YES"
+        # Pick the token matching the direction
+        if direction == "UP":
+            token = market.up_token
+            token_label = "Up"
+            # Fetch fresh mid for up token
+            try:
+                mid = await self._client.get_midpoint(token.token_id)
+            except Exception as exc:
+                log.warning("Midpoint fetch failed %s: %s", cid[:8], exc)
+                return
         else:
-            token_id = market.no_token.token_id
-            mid = no_mid
-            token_label = "NO"
+            token = market.down_token
+            token_label = "Down"
+            try:
+                up_mid = await self._client.get_midpoint(market.up_token.token_id)
+                mid = 1.0 - up_mid
+            except Exception as exc:
+                log.warning("Midpoint fetch failed %s: %s", cid[:8], exc)
+                return
 
-        # Probability bounds guard
+        # Don't chase already-extreme prices
         if not (config.STRATEGY.min_yes_prob <= mid <= config.STRATEGY.max_yes_prob):
-            log.debug(
-                "Market %s: %s mid=%.3f outside tradeable range.",
-                cid[:8], token_label, mid,
-            )
+            log.debug("Market %s: %s mid=%.3f outside range.", cid[:8], token_label, mid)
             return
 
-        order_usdc = min(config.RISK.max_order_usdc, self._remaining_budget())
+        order_usdc = min(self._max_order_usdc, self._remaining_budget())
         if order_usdc < config.RISK.min_order_usdc:
             return
 
         await self._place_order(
             cid=cid,
-            token_id=token_id,
+            token_id=token.token_id,
             token_label=token_label,
             mid=mid,
             order_usdc=order_usdc,
@@ -151,11 +232,10 @@ class OrderManager:
 
     async def execute_arb_signal(self, sig: "ArbSignal") -> None:
         """
-        Execute an arbitrage trade based on a pre-computed ArbSignal.
+        Arb signal: execute using fractional Kelly sizing vs wallet balance.
 
-        Uses fractional Kelly sizing scaled to our risk limits:
-            bet = kelly_f * kelly_fraction * total_budget
-        capped at max_order_usdc and floored at min_order_usdc.
+            kelly_usdc = sig.kelly_f × config.STRATEGY.kelly_fraction × wallet_balance
+            order_usdc = clamp(kelly_usdc, min_order_usdc, max_order_usdc)
         """
         cid = sig.market.condition_id
 
@@ -163,20 +243,13 @@ class OrderManager:
             log.debug("Market %s on cooldown (arb).", cid[:8])
             return
 
-        if self.total_exposure >= config.RISK.max_total_exposure_usdc:
-            log.warning("Total exposure cap reached. Skipping arb signal.")
+        if not self._risk_ok(sig.symbol):
             return
 
-        if self._too_many_positions(sig.symbol):
-            log.warning("Too many positions for %s. Skipping arb signal.", sig.symbol)
-            return
-
-        # Kelly bet: f* × kelly_fraction × bankroll
-        bankroll = config.RISK.max_total_exposure_usdc
-        kelly_usdc = sig.kelly_f * config.STRATEGY.kelly_fraction * bankroll
+        kelly_usdc = sig.kelly_f * config.STRATEGY.kelly_fraction * self._wallet_balance
         order_usdc = max(
             config.RISK.min_order_usdc,
-            min(kelly_usdc, config.RISK.max_order_usdc, self._remaining_budget()),
+            min(kelly_usdc, self._max_order_usdc, self._remaining_budget()),
         )
         if order_usdc < config.RISK.min_order_usdc:
             return
@@ -184,11 +257,11 @@ class OrderManager:
         await self._place_order(
             cid=cid,
             token_id=sig.token_id,
-            token_label=sig.side,
+            token_label=sig.bet,
             mid=sig.market_prob,
             order_usdc=order_usdc,
             question=sig.market.question,
-            source=f"ARB edge={sig.edge:.3f} kelly={sig.kelly_f:.3f}",
+            source=f"ARB edge={sig.edge:.3f} kelly={sig.kelly_f:.3f} wallet=${self._wallet_balance:.0f}",
         )
 
     # ------------------------------------------------------------------
@@ -205,13 +278,15 @@ class OrderManager:
         question: str,
         source: str,
     ) -> None:
-        # Aggressive limit: bid slightly above current mid
         limit_price = round(min(mid + config.RISK.slippage_tolerance, 0.99), 4)
         shares = round(order_usdc / limit_price, 2)
 
         log.info(
-            "[%s]  Buy %-3s  %s  @ %.4f  (%.2f shares / $%.2f USDC)",
-            source, token_label, question[:50], limit_price, shares, order_usdc,
+            "[%s]  Buy %-4s  %s  @ %.4f  (%.2f shares / $%.2f USDC)"
+            "  wallet=$%.2f  deployed=$%.2f",
+            source, token_label, question[:50],
+            limit_price, shares, order_usdc,
+            self._wallet_balance, self.total_exposure,
         )
 
         resp = await self._client.create_limit_order(
@@ -227,8 +302,11 @@ class OrderManager:
                 self._open_exposure.get(cid, 0.0) + order_usdc
             )
             log.info(
-                "Order recorded. cid=%s  total_exposure=$%.2f",
+                "Order recorded.  cid=%s  total_exposure=$%.2f / $%.2f (%.0f%%)",
                 cid[:8], self.total_exposure,
+                self._max_exposure_usdc,
+                (self.total_exposure / self._max_exposure_usdc * 100)
+                if self._max_exposure_usdc else 0,
             )
 
     # ------------------------------------------------------------------
