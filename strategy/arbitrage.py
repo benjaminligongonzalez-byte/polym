@@ -221,6 +221,20 @@ class ArbStrategy:
             )
             return
 
+        # --- 5c. Sniper distance-from-strike gate ---
+        # Even with high fair_prob, a price only 0.3–0.65% past the strike can
+        # flip in the final minutes of a volatile market.  Require a meaningful
+        # clearance before committing to a snipe bet.
+        if is_snipe:
+            price_dist_pct = abs(consensus - market.strike_price) / market.strike_price
+            if price_dist_pct < config.STRATEGY.snipe_min_price_dist_pct:
+                log.debug(
+                    "%s %s sniper: price dist %.2f%% < min %.2f%% — too close to strike",
+                    symbol, cid[:8],
+                    price_dist_pct * 100, config.STRATEGY.snipe_min_price_dist_pct * 100,
+                )
+                return
+
         # --- 6. Edge calculation ---
         edge_up   = p_up   - up_mid
         edge_down = p_down - down_mid

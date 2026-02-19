@@ -51,7 +51,8 @@ HOUSE_SPREAD   = 0.02
 ARB_EDGE       = 0.05
 ARB_MIN_PROB   = 0.65      # minimum fair probability for any ARB entry
 SNIPE_WINDOW   = 300.0     # seconds — activate in final 5 min
-SNIPE_MIN_PROB = 0.75      # minimum fair probability in sniper mode
+SNIPE_MIN_PROB = 0.92      # minimum fair probability in sniper mode
+SNIPE_MIN_PRICE_DIST_PCT = 0.010  # price must be ≥1% past strike to snipe
 SNIPE_EDGE     = 0.03      # lower edge bar (near-certain outcome)
 SNIPE_KELLY    = 0.50      # half-Kelly on near-locks
 ARB_KELLY      = 0.25      # quarter-Kelly for standard arb
@@ -374,6 +375,12 @@ def evaluate(
     if is_snipe and max(p_up, p_down) < SNIPE_MIN_PROB:
         return None
 
+    # Sniper distance gate: price must be ≥1% past strike.
+    # A tiny margin (0.3–0.65%) can evaporate in the final minutes — this
+    # blocks borderline snipes where a small reversal causes a full loss.
+    if is_snipe and abs(live_price - strike) / strike < SNIPE_MIN_PRICE_DIST_PCT:
+        return None
+
     edge_up   = p_up   - up_mid
     edge_down = p_down - down_mid
     best_edge = max(edge_up, edge_down)
@@ -657,19 +664,40 @@ def run(args: argparse.Namespace) -> None:
             current_up_mid = m["up_mid"]
             current_mid = current_up_mid if pos.bet == "Up" else (1.0 - current_up_mid)
 
+            # Pre-compute current fair probability (needed for guard + triggers).
+            live_px = prices.get(pos.symbol)
+            current_fair = None
+            if live_px is not None:
+                _vol = VOLATILITY.get(pos.symbol, DEFAULT_VOL)
+                _p_up = fair_prob_up(live_px, pos.strike, max(t_rem_pos, 1), _vol)
+                current_fair = _p_up if pos.bet == "Up" else (1.0 - _p_up)
+
+            # Guard: only sell at a loss when conviction is genuinely gone.
+            # If net sell (mid − slippage) is below entry AND the model still
+            # gives ≥ ARB_MIN_PROB, hold through the dip.
+            # If fair_prob has dropped below ARB_MIN_PROB the trade thesis is
+            # broken — allow a stop-loss exit even at a loss.
+            effective_sell = current_mid - SLIPPAGE
+            if effective_sell <= pos.entry_price:
+                if current_fair is None or current_fair >= ARB_MIN_PROB:
+                    continue  # still believe in trade — hold through the dip
+                # conviction gone → fall through to stop-loss trigger
+
             should_exit = False
             exit_type   = ""
 
-            # Trigger 1: fair-value alignment
-            live_px = prices.get(pos.symbol)
-            if EXIT_RESIDUAL_EDGE > 0.0 and live_px is not None:
-                vol  = VOLATILITY.get(pos.symbol, DEFAULT_VOL)
-                p_up = fair_prob_up(live_px, pos.strike, max(t_rem_pos, 1), vol)
-                fair = p_up if pos.bet == "Up" else (1.0 - p_up)
-                residual = fair - current_mid
+            # Trigger 1: fair-value alignment (profit capture)
+            if EXIT_RESIDUAL_EDGE > 0.0 and current_fair is not None:
+                residual = current_fair - current_mid
                 if residual <= EXIT_RESIDUAL_EDGE:
                     should_exit = True
-                    exit_type   = f"fair-val(fair={fair:.3f} mkt={current_mid:.3f})"
+                    exit_type   = f"fair-val(fair={current_fair:.3f} mkt={current_mid:.3f})"
+
+            # Trigger 1b: stop-loss — conviction dropped below entry threshold
+            if not should_exit and current_fair is not None:
+                if current_fair < ARB_MIN_PROB:
+                    should_exit = True
+                    exit_type   = f"stop-loss(fair={current_fair:.3f}<{ARB_MIN_PROB})"
 
             # Trigger 2: flat take-profit fallback
             if not should_exit and EXIT_TAKE_PROFIT > 0.0:
@@ -743,11 +771,13 @@ def run(args: argparse.Namespace) -> None:
                 if best < threshold:
                     reason = "no edge"
                 elif is_snipe and max(p_up, p_down) < SNIPE_MIN_PROB:
-                    reason = "confidence gate"
+                    reason = f"confidence gate (fair={max(p_up,p_down):.2f}<{SNIPE_MIN_PROB})"
+                elif is_snipe and abs(live_px - strike) / strike < SNIPE_MIN_PRICE_DIST_PCT:
+                    reason = f"too close to strike ({abs(live_px-strike)/strike:.1%}<{SNIPE_MIN_PRICE_DIST_PCT:.1%})"
                 elif not is_snipe and best_fair < ARB_MIN_PROB:
                     reason = f"low conviction (fair={best_fair:.2f}<{ARB_MIN_PROB})"
                 else:
-                    reason = "confidence gate"
+                    reason = "no edge on near-certain side"
                 print(f"      {DIM}↳ no trade ({reason}){RESET}")
                 continue
 

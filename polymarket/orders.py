@@ -351,22 +351,46 @@ class OrderManager:
                 log.debug("Exit check: midpoint fetch failed %s: %s", cid[:8], exc)
                 continue
 
-            # ---- Trigger 1: fair-value alignment ----
+            # Pre-compute current fair probability (needed for guard + triggers).
+            consensus = self._aggregator.consensus_price(pos.symbol)
+            current_fair: float | None = None
+            if consensus is not None:
+                vol = config.VOLATILITY.get(pos.symbol, config.DEFAULT_ANNUAL_VOL)
+                p_up = fair_prob_up(consensus, pos.strike_price, t_rem, vol)
+                current_fair = p_up if pos.bet == "Up" else (1.0 - p_up)
+
+            # Guard: hold through temporary dips when model still has conviction.
+            # Check net sell price (mid minus slippage) vs entry to avoid
+            # crystallising a loss via slippage on a near-breakeven exit.
+            # Exception: allow exit when conviction is gone (stop-loss path).
+            effective_sell = current_mid - config.RISK.slippage_tolerance
+            if effective_sell <= pos.entry_price:
+                if current_fair is None or current_fair >= config.STRATEGY.arb_min_fair_prob:
+                    continue  # still believe in trade — hold through the dip
+                # conviction gone → fall through to stop-loss trigger
+
+            # ---- Trigger 1: fair-value alignment (profit capture) ----
             should_exit = False
             exit_reason = ""
-            if config.STRATEGY.exit_residual_edge > 0.0:
-                consensus = self._aggregator.consensus_price(pos.symbol)
-                if consensus is not None:
-                    vol = config.VOLATILITY.get(pos.symbol, config.DEFAULT_ANNUAL_VOL)
-                    p_up = fair_prob_up(consensus, pos.strike_price, t_rem, vol)
-                    fair = p_up if pos.bet == "Up" else (1.0 - p_up)
-                    residual = fair - current_mid
-                    if residual <= config.STRATEGY.exit_residual_edge:
-                        should_exit = True
-                        exit_reason = (
-                            f"fair-val fair={fair:.3f} mkt={current_mid:.3f} "
-                            f"residual={residual:.3f}"
-                        )
+            if config.STRATEGY.exit_residual_edge > 0.0 and current_fair is not None:
+                residual = current_fair - current_mid
+                if residual <= config.STRATEGY.exit_residual_edge:
+                    should_exit = True
+                    exit_reason = (
+                        f"fair-val fair={current_fair:.3f} mkt={current_mid:.3f} "
+                        f"residual={residual:.3f}"
+                    )
+
+            # ---- Trigger 1b: stop-loss (conviction lost) ----
+            # Exit even at a loss when our model's fair probability for the bet
+            # has dropped below the minimum entry conviction threshold.
+            if not should_exit and current_fair is not None:
+                if current_fair < config.STRATEGY.arb_min_fair_prob:
+                    should_exit = True
+                    exit_reason = (
+                        f"stop-loss fair={current_fair:.3f} < "
+                        f"arb_min={config.STRATEGY.arb_min_fair_prob:.2f}"
+                    )
 
             # ---- Trigger 2: flat take-profit fallback ----
             if not should_exit and config.STRATEGY.exit_take_profit > 0.0:

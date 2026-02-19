@@ -168,7 +168,15 @@ class StrategyConfig:
 
     # Only fire in sniper mode when our fair probability is this high.
     # Below this threshold the outcome is still too uncertain — skip it.
-    snipe_min_fair_prob: float = 0.75    # ≥75% confident the bet wins
+    # 0.92 removes marginal snipes where price is barely past strike (≤0.5%
+    # away) and a small reversal in the final minutes causes a full loss.
+    snipe_min_fair_prob: float = 0.92    # ≥92% confident the bet wins
+
+    # Minimum distance (as a fraction of strike) between live price and strike
+    # before firing a sniper bet.  Even with high fair_prob, a price only 0.3%
+    # past the strike can flip in the final minutes of a volatile market.
+    # e.g. 0.010 = live price must be ≥1% above/below the strike to snipe.
+    snipe_min_price_dist_pct: float = 0.010
 
     # Minimum edge in sniper mode (lower than arb_edge_threshold because
     # a near-certain bet needs only a small margin over the house spread).
