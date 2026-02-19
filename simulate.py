@@ -61,6 +61,11 @@ MIN_ORDER        = 2.0
 SLIPPAGE         = 0.03
 COOLDOWN         = 30.0
 
+# Early exit parameters (mirrors config.py)
+EXIT_RESIDUAL_EDGE = 0.02  # sell when market is within 2¢ of fair value
+EXIT_TAKE_PROFIT   = 0.07  # flat fallback: sell when up 7¢ from entry
+EXIT_MIN_T_REM     = 90.0  # never exit within 90s of expiry
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Math helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -267,12 +272,14 @@ class Position:
     order_usdc: float
     shares: float
     strike: float
-    end_secs: float     # time.monotonic() when market expires
+    end_secs: float     # sim_now / monotonic when market expires
     is_snipe: bool
     mode: str
     live_price_at_entry: float
     won: Optional[bool] = None
     pnl: float = 0.0
+    exit_price: Optional[float] = None   # set on early exit
+    exit_type: str = ""                  # "fair-val" | "flat-tp" | "resolution"
 
 class Wallet:
     def __init__(self, starting: float):
@@ -307,6 +314,7 @@ class Wallet:
 
     def settle(self, pos: Position, won: bool, final_price: float) -> None:
         pos.won = won
+        pos.exit_type = "resolution"
         if won:
             pnl = pos.shares - pos.order_usdc   # net profit (shares × $1 − cost)
             self.balance += pos.shares           # collect $1 per winning share
@@ -314,6 +322,20 @@ class Wallet:
             self.wins += 1
         else:
             pos.pnl = -pos.order_usdc            # total loss (already deducted at open)
+            self.losses += 1
+        self.close_order(pos.cid)
+
+    def early_exit(self, pos: Position, sell_price: float, exit_type: str) -> None:
+        """Simulate a take-profit sell before resolution."""
+        proceeds = round(pos.shares * sell_price, 4)
+        pos.pnl = proceeds - pos.order_usdc
+        pos.won = pos.pnl >= 0
+        pos.exit_price = sell_price
+        pos.exit_type = exit_type
+        self.balance += proceeds                 # cash back in wallet
+        if pos.won:
+            self.wins += 1
+        else:
             self.losses += 1
         self.close_order(pos.cid)
 
@@ -502,8 +524,8 @@ def run(args: argparse.Namespace) -> None:
 
         # ── Fetch / build market list ─────────────────────────────────────────
         if args.demo:
-            # Advance each market's t_rem by one cycle interval
-            secs_passed = args.interval
+            # Advance each market's t_rem by SIM_STEP (simulated seconds per cycle)
+            secs_passed = SIM_STEP
             markets = []
             for tmpl in _DEMO_MARKETS_TEMPLATE:
                 t_rem = max(0.0, tmpl["t_rem_0"] - (cycle - 1) * secs_passed)
@@ -555,6 +577,9 @@ def run(args: argparse.Namespace) -> None:
         if expired:
             print(f"\n  {BOLD}SETTLING EXPIRED POSITIONS{RESET}")
         for pos in expired:
+            # Skip positions that were already closed by early exit
+            if pos.won is not None:
+                continue
             final_price = prices.get(pos.symbol)
             if final_price is None:
                 continue
@@ -571,6 +596,64 @@ def run(args: argparse.Namespace) -> None:
                 f"staked=${pos.order_usdc:.2f}  "
                 f"pnl={GREEN if pos.pnl>=0 else RED}{pos.pnl:+.2f}{RESET}"
             )
+
+        # ── Early-exit scan (fair-value alignment + flat take-profit) ─────────
+        # Build a quick lookup: cid → current market data for this cycle
+        _mkt_lookup = {m["cid"]: m for m in markets}
+        early_exits_this_cycle = []
+
+        for pos in [p for p in positions if p.won is None]:
+            m = _mkt_lookup.get(pos.cid)
+            if m is None:
+                continue
+
+            t_rem_pos = m["t_rem"]
+            if t_rem_pos < EXIT_MIN_T_REM:
+                continue
+            # Snipe positions near the end are near-locks — let them resolve
+            if pos.is_snipe and t_rem_pos < SNIPE_WINDOW:
+                continue
+
+            current_up_mid = m["up_mid"]
+            current_mid = current_up_mid if pos.bet == "Up" else (1.0 - current_up_mid)
+
+            should_exit = False
+            exit_type   = ""
+
+            # Trigger 1: fair-value alignment
+            live_px = prices.get(pos.symbol)
+            if EXIT_RESIDUAL_EDGE > 0.0 and live_px is not None:
+                vol  = VOLATILITY.get(pos.symbol, DEFAULT_VOL)
+                p_up = fair_prob_up(live_px, pos.strike, max(t_rem_pos, 1), vol)
+                fair = p_up if pos.bet == "Up" else (1.0 - p_up)
+                residual = fair - current_mid
+                if residual <= EXIT_RESIDUAL_EDGE:
+                    should_exit = True
+                    exit_type   = f"fair-val(fair={fair:.3f} mkt={current_mid:.3f})"
+
+            # Trigger 2: flat take-profit fallback
+            if not should_exit and EXIT_TAKE_PROFIT > 0.0:
+                if (current_mid - pos.entry_price) >= EXIT_TAKE_PROFIT:
+                    should_exit = True
+                    exit_type   = f"flat-tp(+{current_mid - pos.entry_price:.3f})"
+
+            if not should_exit:
+                continue
+
+            sell_price = round(max(current_mid - SLIPPAGE, 0.01), 4)
+            wallet.early_exit(pos, sell_price, exit_type)
+            early_exits_this_cycle.append((pos, sell_price, exit_type))
+
+        if early_exits_this_cycle:
+            print(f"\n  {BOLD}EARLY EXITS ({len(early_exits_this_cycle)}){RESET}")
+            for pos, sp, xt in early_exits_this_cycle:
+                tag = f"{GREEN}PROFIT{RESET}" if pos.pnl >= 0 else f"{RED}LOSS{RESET}"
+                print(
+                    f"  [{tag}]  {CYAN}{pos.symbol}{RESET}  {pos.mode}  "
+                    f"bet={pos.bet}  entry={pos.entry_price:.4f}  sell={sp:.4f}  "
+                    f"shares={pos.shares:.2f}  pnl={GREEN if pos.pnl>=0 else RED}{pos.pnl:+.2f}{RESET}"
+                    f"  [{xt}]"
+                )
 
         # ── Scan markets ─────────────────────────────────────────────────────
         print(f"\n  {BOLD}MARKET SCAN  ({len(markets)} active 15-min markets){RESET}")
@@ -686,18 +769,23 @@ def run(args: argparse.Namespace) -> None:
     if settled:
         total_staked = sum(p.order_usdc for p in settled)
         total_pnl    = sum(p.pnl for p in settled)
-        wins = [p for p in settled if p.won]
+        wins   = [p for p in settled if p.won]
         losses = [p for p in settled if not p.won]
         snipes = [p for p in settled if p.is_snipe]
         arbs   = [p for p in settled if not p.is_snipe]
+        early  = [p for p in settled if p.exit_type not in ("resolution", "")]
         print(f"\n  Settled trades:     {len(settled)}")
         print(f"  Win / Loss:         {GREEN}{len(wins)}{RESET} / {RED}{len(losses)}{RESET}"
-              f"  ({len(wins)/len(settled)*100:.0f}% win rate)" if settled else "")
+              + (f"  ({len(wins)/len(settled)*100:.0f}% win rate)" if settled else ""))
+        print(f"  Early exits:        {len(early)}  "
+              + f"(fair-val: {sum(1 for p in early if 'fair-val' in p.exit_type)}  "
+              + f"flat-tp: {sum(1 for p in early if 'flat-tp' in p.exit_type)})")
         print(f"  SNIPE trades:       {len(snipes)}  wins={sum(1 for p in snipes if p.won)}")
         print(f"  ARB trades:         {len(arbs)}  wins={sum(1 for p in arbs if p.won)}")
         print(f"  Total staked:       ${total_staked:.2f}")
         print(f"  Total PnL:          {GREEN if total_pnl>=0 else RED}{total_pnl:+.2f}{RESET}")
-        print(f"  ROI on staked:      {total_pnl/total_staked*100:+.1f}%" if total_staked else "")
+        if total_staked:
+            print(f"  ROI on staked:      {total_pnl/total_staked*100:+.1f}%")
 
     total_value = wallet.balance + wallet.deployed
     settled_pnl = total_value - wallet.starting
