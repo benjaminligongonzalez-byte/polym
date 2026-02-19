@@ -140,8 +140,16 @@ class StrategyConfig:
     # a flat %-distance check.  Set to 0.0 to disable.
     arb_min_d2: float = 1.1
 
-    # How often (seconds) to scan all markets for arb opportunities
-    arb_scan_interval: float = 2.0
+    # How often (seconds) to run the polling scan loop (exit checks + midpoint refresh).
+    # Entry re-evaluation is also triggered on every price tick (event-driven),
+    # so this only needs to be fast enough to catch midpoint updates between ticks.
+    arb_scan_interval: float = 0.1
+
+    # How long (seconds) to reuse a cached Polymarket midpoint before re-fetching.
+    # Prevents hammering the CLOB API when price ticks arrive faster than the API
+    # can respond.  Entry re-evaluations on each tick use the cache; fresh fetches
+    # happen at most once per midpoint_cache_ttl per market.
+    midpoint_cache_ttl: float = 1.5
 
     # Fractional Kelly multiplier applied to the full-Kelly bet size.
     # 0.25 = quarter Kelly (conservative; good starting point).

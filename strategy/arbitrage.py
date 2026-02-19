@@ -147,18 +147,44 @@ class ArbStrategy:
         # condition_id → monotonic timestamp of last emitted signal
         self._last_signal: dict[str, float] = {}
         self._order_manager: Any = None
+        # Polymarket midpoint cache: token_id → (mid_price, monotonic_timestamp)
+        # Prevents hammering the CLOB API when price ticks arrive at sub-second rates.
+        # Cache entries are reused for up to config.STRATEGY.midpoint_cache_ttl seconds.
+        self._midpoint_cache: dict[str, tuple[float, float]] = {}
 
     def set_order_manager(self, order_manager: Any) -> None:
         """Wire in the OrderManager so we can trigger exit scans."""
         self._order_manager = order_manager
 
     async def run(self) -> None:
+        """
+        Polling loop: runs exit checks and full market scans at arb_scan_interval
+        (default 0.1 s).  Entry signals are also fired immediately via on_price_tick
+        on every incoming price event — this loop handles exits and catches any
+        markets where the price hasn't moved but the Polymarket mid has shifted.
+        """
         while True:
             await asyncio.sleep(config.STRATEGY.arb_scan_interval)
             # Check early exits first (free up capital before scanning for new entries)
             if self._order_manager is not None:
                 await self._order_manager.check_exits()
             await self._scan_all()
+
+    async def on_price_tick(self, symbol: str, price: float, ts: float) -> None:
+        """
+        Called on every incoming price tick from Binance / Coinbase.
+
+        Immediately re-evaluates all open markets for *symbol* so we react to
+        price moves in the time it takes a WebSocket frame to arrive — not on the
+        next polling interval.  Uses cached Polymarket midpoints so no extra CLOB
+        API calls are made per tick.
+        """
+        markets = [m for m in self._cache.all_markets() if m.symbol == symbol]
+        if markets:
+            await asyncio.gather(
+                *[self._evaluate(m) for m in markets],
+                return_exceptions=True,
+            )
 
     async def _scan_all(self) -> None:
         markets = self._cache.all_markets()
@@ -197,12 +223,22 @@ class ArbStrategy:
             else config.STRATEGY.arb_edge_threshold
         )
 
-        # --- 4. Fetch live Polymarket prices for both tokens ---
-        try:
-            up_mid = await self._pm_client.get_midpoint(market.up_token.token_id)
-        except Exception as exc:
-            log.debug("Midpoint fetch failed for %s: %s", cid[:8], exc)
-            return
+        # --- 4. Fetch live Polymarket prices for both tokens (cache-backed) ---
+        # Re-use a cached midpoint if it is younger than midpoint_cache_ttl.
+        # This lets on_price_tick fire on every Binance/Coinbase trade event
+        # without making a CLOB API call on every single tick.
+        token_id = market.up_token.token_id
+        _now_mono = time.monotonic()
+        cached = self._midpoint_cache.get(token_id)
+        if cached and (_now_mono - cached[1]) < config.STRATEGY.midpoint_cache_ttl:
+            up_mid = cached[0]
+        else:
+            try:
+                up_mid = await self._pm_client.get_midpoint(token_id)
+            except Exception as exc:
+                log.debug("Midpoint fetch failed for %s: %s", cid[:8], exc)
+                return
+            self._midpoint_cache[token_id] = (up_mid, _now_mono)
         down_mid = 1.0 - up_mid   # Up + Down must sum to 1 per contract
 
         # --- 5. Fair probability ---

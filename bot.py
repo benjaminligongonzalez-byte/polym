@@ -152,6 +152,11 @@ class Bot:
             )
             # Give arb strategy access to OrderManager so it can run exit scans
             self._arb.set_order_manager(self._order_manager)
+            # Subscribe to price ticks so the arb strategy re-evaluates markets
+            # immediately on every incoming Binance/Coinbase trade event, rather
+            # than waiting for the next polling interval.  Midpoints are cached
+            # inside ArbStrategy so no extra CLOB API calls are made per tick.
+            self._aggregator.add_subscriber(self._arb.on_price_tick)
 
         # 5. Wire feeds → aggregator
         binance_cb = make_feed_callback(self._aggregator, "binance")

@@ -529,21 +529,30 @@ def run(args: argparse.Namespace) -> None:
 
     # Per-run randomised initial Polymarket lag: each market starts with a
     # different amount of stale pricing so different edges are visible.
+    # current_up_mid is the live stateful mid — updated each cycle via geometric
+    # convergence rather than re-computed from initial value each time.
     _run_markets = []
     for tmpl in _DEMO_MARKETS_TEMPLATE:
         lag_bias = random.uniform(-0.06, 0.10)   # negative = already priced in; positive = bigger lag
-        new_mid  = round(max(0.05, min(0.95, tmpl["up_mid_0"] + lag_bias)), 3)
-        _run_markets.append({**tmpl, "up_mid_0": new_mid})
+        init_mid = round(max(0.05, min(0.95, tmpl["up_mid_0"] + lag_bias)), 3)
+        _run_markets.append({**tmpl, "up_mid_0": init_mid, "current_up_mid": init_mid})
 
     cycle_start = time.monotonic()
 
     # Simulated clock (seconds elapsed in the simulation).
-    # Each cycle advances it by sim_step seconds.
-    # This lets positions expire properly within the demo without
-    # waiting for real wall-clock time.
+    # Each cycle advances it by SIM_STEP seconds.
     sim_now: float = 0.0
-    # In demo mode each "cycle" represents 90 simulated seconds of trading
-    SIM_STEP: float = 90.0 if args.demo else args.interval
+    # In demo mode each cycle represents 1 simulated second — matching real-time
+    # resolution and eliminating the blind spot between cycles that caused last-
+    # second snipe reversals to be undetectable.  Live mode uses --interval.
+    SIM_STEP: float = 1.0 if args.demo else args.interval
+
+    # In demo mode, suppress per-cycle noise and only print events + periodic
+    # snapshots every SNAPSHOT_INTERVAL simulated seconds.  Pass --verbose to
+    # restore full per-cycle output (useful for debugging a single run).
+    verbose: bool = not args.demo or getattr(args, "verbose", False)
+    SNAPSHOT_INTERVAL: float = 60.0
+    last_snapshot: float = -(SNAPSHOT_INTERVAL + 1.0)   # force first snapshot immediately
 
     print(f"\n{'═'*70}")
     print(f"  {BOLD}POLYMARKET PAPER-TRADING SIMULATOR{RESET}")
@@ -551,6 +560,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Mode: {mode_label}  |  Starting wallet: ${args.wallet:,.2f}  |  seed={seed}")
     print(f"  Strategy: Momentum + ARB + Late-window SNIPER")
     print(f"  Sniper window: final {SNIPE_WINDOW:.0f}s  |  min confidence: {SNIPE_MIN_PROB:.0%}")
+    if args.demo:
+        print(f"  Sim resolution: 1s/cycle  |  output: events + 60s snapshots (--verbose for full)")
     print(f"{'═'*70}\n")
 
     while cycle < args.cycles:
@@ -559,18 +570,26 @@ def run(args: argparse.Namespace) -> None:
         now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         elapsed = time.monotonic() - cycle_start
 
-        print(f"{'─'*70}")
-        print(f"  {BOLD}CYCLE {cycle}{RESET}  {now_str}  (elapsed: {elapsed:.0f}s)")
-        print(f"{'─'*70}")
+        is_snapshot = (sim_now - last_snapshot) >= SNAPSHOT_INTERVAL
+        show_cycle  = verbose or is_snapshot
+
+        if show_cycle:
+            print(f"{'─'*70}")
+            sim_ts = f"  sim={sim_now:.0f}s" if args.demo else ""
+            print(f"  {BOLD}CYCLE {cycle}{RESET}  {now_str}{sim_ts}  (elapsed: {elapsed:.0f}s)")
+            print(f"{'─'*70}")
 
         # ── Fetch / update prices ─────────────────────────────────────────────
         if args.demo:
             # Drift prices using randomised Gaussian moves each cycle.
-            # Mean drift slightly positive (crypto upward bias); std scaled by
-            # per-symbol volatility so XRP/SOL move more than BTC.
+            # Volatility (std) scales with sqrt(SIM_STEP) — Brownian motion.
+            # Mean drift scales linearly so total expected drift is the same
+            # regardless of step size.  At SIM_STEP=1 this gives per-second
+            # moves; at SIM_STEP=90 (old default) it matched the original model.
+            step_scale = math.sqrt(SIM_STEP / 90.0)
             for sym in TARGET_SYMBOLS:
-                vol_per_step = _DRIFT_PCT[sym] * 2.5
-                drift = random.gauss(vol_per_step * 0.3, vol_per_step)
+                vol_per_step = _DRIFT_PCT[sym] * 2.5 * step_scale
+                drift = random.gauss(vol_per_step * 0.3 * step_scale, vol_per_step)
                 demo_prices[sym] = demo_prices[sym] * (1 + drift)
             prices = demo_prices.copy()
         else:
@@ -581,9 +600,10 @@ def run(args: argparse.Namespace) -> None:
                 time.sleep(args.interval)
                 continue
 
-        print(f"\n  {BOLD}LIVE PRICES{RESET}")
-        for sym, px in sorted(prices.items()):
-            print(f"    {CYAN}{sym:3s}{RESET}  ${px:>12,.4f}")
+        if show_cycle:
+            print(f"\n  {BOLD}LIVE PRICES{RESET}")
+            for sym, px in sorted(prices.items()):
+                print(f"    {CYAN}{sym:3s}{RESET}  ${px:>12,.4f}")
 
         # ── Fetch / build market list ─────────────────────────────────────────
         if args.demo:
@@ -591,18 +611,22 @@ def run(args: argparse.Namespace) -> None:
             secs_passed = SIM_STEP
             markets = []
             for tmpl in _run_markets:
-                t_rem = max(0.0, tmpl["t_rem_0"] - (cycle - 1) * secs_passed)
+                t_rem = max(0.0, tmpl["t_rem_0"] - (cycle - 1) * SIM_STEP)
                 sym = tmpl["symbol"]
                 p_live = prices.get(sym, tmpl["strike"])
                 vol = VOLATILITY.get(sym, DEFAULT_VOL)
                 fp = fair_prob_up(p_live, tmpl["strike"], max(t_rem, 5), vol)
-                # Polymarket reprices at a randomised speed (25–55% of gap per cycle)
-                # plus small noise so the lag isn't perfectly smooth
-                reprice_speed = random.uniform(0.25, 0.55)
-                noise = random.gauss(0, 0.015)
-                current_up_mid = tmpl["up_mid_0"] + (fp - tmpl["up_mid_0"]) * reprice_speed * max(cycle-1, 0) + noise
-                current_up_mid = round(max(0.01, min(0.99, current_up_mid)), 3)
-                markets.append({**tmpl, "t_rem": t_rem, "up_mid": current_up_mid})
+                # Stateful geometric convergence: each second the market closes
+                # 0.8–1.8% of the remaining gap toward fair value, plus small noise.
+                # This is mathematically correct (unlike the old linear accumulation
+                # formula) and works at any step size without diverging.
+                prev_mid = tmpl["current_up_mid"]
+                reprice_speed = random.uniform(0.008, 0.018) * SIM_STEP
+                noise = random.gauss(0, 0.001 * math.sqrt(SIM_STEP))
+                new_mid = prev_mid + (fp - prev_mid) * reprice_speed + noise
+                new_mid = round(max(0.01, min(0.99, new_mid)), 3)
+                tmpl["current_up_mid"] = new_mid   # persist for next cycle
+                markets.append({**tmpl, "t_rem": t_rem, "up_mid": new_mid})
         else:
             try:
                 raw_markets = live_markets()
@@ -742,7 +766,8 @@ def run(args: argparse.Namespace) -> None:
                 )
 
         # ── Scan markets ─────────────────────────────────────────────────────
-        print(f"\n  {BOLD}MARKET SCAN  ({len(markets)} active 15-min markets){RESET}")
+        if show_cycle:
+            print(f"\n  {BOLD}MARKET SCAN  ({len(markets)} active 15-min markets){RESET}")
         fired_this_cycle = 0
 
         for m in markets:
@@ -765,48 +790,52 @@ def run(args: argparse.Namespace) -> None:
             is_snipe  = t_rem < SNIPE_WINDOW
             threshold = SNIPE_EDGE if is_snipe else ARB_EDGE
 
-            print(_fmt_market_scan(
-                sym, cid, strike, t_rem, live_px,
-                up_mid, p_up, edge_u, edge_d, threshold, is_snipe
-            ))
+            if show_cycle:
+                print(_fmt_market_scan(
+                    sym, cid, strike, t_rem, live_px,
+                    up_mid, p_up, edge_u, edge_d, threshold, is_snipe
+                ))
 
             # Already have an open position on this market?
             already_open = any(
                 p.cid == cid and p.won is None for p in positions
             )
             if already_open:
-                print(f"      {DIM}↳ position already open — skip{RESET}")
+                if show_cycle:
+                    print(f"      {DIM}↳ position already open — skip{RESET}")
                 continue
 
             trade = evaluate(sym, cid, strike, t_rem, live_px, up_mid, wallet, cooldowns, sim_now)
 
             if trade is None:
-                best = max(edge_u, edge_d)
-                best_fair = max(
-                    p_up if edge_u >= edge_d else 0.0,
-                    p_down if edge_d > edge_u else 0.0
-                )
-                if best < threshold:
-                    reason = "no edge"
-                elif is_snipe and max(p_up, p_down) < SNIPE_MIN_PROB:
-                    reason = f"confidence gate (fair={max(p_up,p_down):.2f}<{SNIPE_MIN_PROB})"
-                elif is_snipe and abs(live_px - strike) / strike < SNIPE_MIN_PRICE_DIST_PCT:
-                    reason = f"too close to strike ({abs(live_px-strike)/strike:.1%}<{SNIPE_MIN_PRICE_DIST_PCT:.1%})"
-                elif not is_snipe and best_fair < ARB_MIN_PROB:
-                    reason = f"low conviction (fair={best_fair:.2f}<{ARB_MIN_PROB})"
-                else:
-                    reason = "no edge on near-certain side"
-                print(f"      {DIM}↳ no trade ({reason}){RESET}")
+                if show_cycle:
+                    best = max(edge_u, edge_d)
+                    best_fair = max(
+                        p_up if edge_u >= edge_d else 0.0,
+                        p_down if edge_d > edge_u else 0.0
+                    )
+                    if best < threshold:
+                        reason = "no edge"
+                    elif is_snipe and max(p_up, p_down) < SNIPE_MIN_PROB:
+                        reason = f"confidence gate (fair={max(p_up,p_down):.2f}<{SNIPE_MIN_PROB})"
+                    elif is_snipe and abs(live_px - strike) / strike < SNIPE_MIN_PRICE_DIST_PCT:
+                        reason = f"too close to strike ({abs(live_px-strike)/strike:.1%}<{SNIPE_MIN_PRICE_DIST_PCT:.1%})"
+                    elif not is_snipe and best_fair < ARB_MIN_PROB:
+                        reason = f"low conviction (fair={best_fair:.2f}<{ARB_MIN_PROB})"
+                    else:
+                        reason = "no edge on near-certain side"
+                    print(f"      {DIM}↳ no trade ({reason}){RESET}")
                 continue
 
-            # ── PAPER ORDER ──────────────────────────────────────────────────
+            # ── PAPER ORDER — always printed regardless of verbosity ──────────
             tag = f"{YELLOW}★ SNIPE{RESET}" if trade["is_snipe"] else f"{CYAN}◆ ARB{RESET}"
             print(
-                f"      {tag}  {BOLD}BUY {trade['bet']}{RESET}"
+                f"\n  [sim={sim_now:.0f}s]  {tag}  {BOLD}BUY {trade['bet']}{RESET}"
+                f"  {CYAN}{sym}{RESET}  strike=${strike:,.4f}"
                 f"  @ {trade['limit_price']:.4f}  "
                 f"shares={trade['shares']:.2f}  cost=${trade['order_usdc']:.2f}  "
                 f"fair={trade['fair_prob']:.3f}  edge={trade['edge']:+.3f}  "
-                f"kelly={trade['kelly_f']:.3f}×{trade['kelly_mult']}"
+                f"t_rem={t_rem:.0f}s"
             )
 
             # Record position — use sim_now for demo, real time for live
@@ -831,23 +860,31 @@ def run(args: argparse.Namespace) -> None:
             cooldowns[cid] = sim_now
             fired_this_cycle += 1
 
-        # ── Open positions summary ────────────────────────────────────────────
+        # ── Open positions summary + wallet ──────────────────────────────────
         open_pos = [p for p in positions if p.won is None]
-        if open_pos:
-            print(f"\n  {BOLD}OPEN POSITIONS ({len(open_pos)}){RESET}")
-            for p in open_pos:
-                _now_disp = sim_now if args.demo else time.monotonic()
-                t_left = max(0.0, p.end_secs - _now_disp)
-                print(
-                    f"    {CYAN}{p.symbol:3s}{RESET}  {p.mode:5s}  "
-                    f"bet={p.bet:4s}  strike=${p.strike:,.4f}  "
-                    f"entry={p.entry_price:.4f}  "
-                    f"cost=${p.order_usdc:.2f}  "
-                    f"t_left={t_left:.0f}s"
-                )
+        had_activity = bool(expired or early_exits_this_cycle or fired_this_cycle)
 
-        # ── Wallet summary ────────────────────────────────────────────────────
-        print(f"\n  {_fmt_wallet(wallet)}\n")
+        if show_cycle or had_activity:
+            if open_pos:
+                print(f"\n  {BOLD}OPEN POSITIONS ({len(open_pos)}){RESET}")
+                for p in open_pos:
+                    _now_disp = sim_now if args.demo else time.monotonic()
+                    t_left = max(0.0, p.end_secs - _now_disp)
+                    print(
+                        f"    {CYAN}{p.symbol:3s}{RESET}  {p.mode:5s}  "
+                        f"bet={p.bet:4s}  strike=${p.strike:,.4f}  "
+                        f"entry={p.entry_price:.4f}  "
+                        f"cost=${p.order_usdc:.2f}  "
+                        f"t_left={t_left:.0f}s"
+                    )
+            print(f"\n  {_fmt_wallet(wallet)}\n")
+            if is_snapshot:
+                last_snapshot = sim_now
+
+        # ── Auto-stop in demo mode when all markets have expired and no
+        #    positions remain open (avoids running 999 empty cycles) ──────────
+        if args.demo and all(m["t_rem"] <= 0 for m in markets) and not open_pos:
+            break
 
         if cycle < args.cycles:
             time.sleep(args.interval)
@@ -915,6 +952,8 @@ def main() -> None:
                         help="Number of consecutive runs; each run starts with the previous run's ending balance")
     parser.add_argument("--seed",     type=int,   default=None,
                         help="Random seed for reproducibility (default: random each run)")
+    parser.add_argument("--verbose",  action="store_true",
+                        help="Print full per-cycle market scan in demo mode (default: events-only)")
     args = parser.parse_args()
 
     try:
