@@ -143,6 +143,12 @@ class StrategyConfig:
     # At <90s the market is nearly resolved — selling early just wastes fees.
     exit_min_t_rem: float = 90.0
 
+    # Fair-value exit: sell when current market price is within this many cents
+    # of the live fair probability.  e.g. 0.02 = exit when market has caught up
+    # to within 2¢ of our fair value estimate (captures the full reprice rather
+    # than a flat +7¢ bump).  Set to 0.0 to use only the flat exit_take_profit.
+    exit_residual_edge: float = 0.02
+
     # ---- Late-window sniper mode ----
     # The target strategy: only bet in the final minutes when the outcome
     # is nearly certain but Polymarket prices haven't fully caught up yet.

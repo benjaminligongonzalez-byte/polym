@@ -47,6 +47,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from feeds.aggregator import PriceAggregator
 from polymarket.client import PolymarketClient
 from polymarket.markets import MarketCache, MarketInfo
 import config
@@ -72,6 +73,7 @@ class OpenPosition:
     cost_usdc: float    # USDC spent
     question: str
     symbol: str
+    strike_price: float # strike K used in the fair-value model
     is_snipe: bool
     entered_at: float   # time.monotonic()
 
@@ -84,9 +86,15 @@ class OrderManager:
     run_balance_refresh_loop().
     """
 
-    def __init__(self, client: PolymarketClient, cache: MarketCache) -> None:
+    def __init__(
+        self,
+        client: PolymarketClient,
+        cache: MarketCache,
+        aggregator: PriceAggregator,
+    ) -> None:
         self._client = client
         self._cache = cache
+        self._aggregator = aggregator
         self._wallet_balance: float = 0.0          # live USDC balance
         self._last_balance_log: float = 0.0
         # condition_id → last trade timestamp (monotonic)
@@ -240,6 +248,7 @@ class OrderManager:
             order_usdc=order_usdc,
             question=market.question,
             symbol=market.symbol,
+            strike_price=market.strike_price or 0.0,
             source="MOMENTUM",
             is_snipe=False,
         )
@@ -284,6 +293,7 @@ class OrderManager:
             order_usdc=order_usdc,
             question=sig.market.question,
             symbol=sig.symbol,
+            strike_price=sig.strike_price,
             source=(
                 f"{mode} fair={sig.fair_prob:.3f} edge={sig.edge:.3f}"
                 f" kelly={sig.kelly_f:.3f}×{kelly_mult} wallet=${self._wallet_balance:.0f}"
@@ -297,23 +307,31 @@ class OrderManager:
 
     async def check_exits(self) -> None:
         """
-        Scan all open positions and sell any that have repriced by
-        config.STRATEGY.exit_take_profit cents above the entry price.
+        Scan all open positions and exit any that have sufficiently repriced.
 
-        Called every arb scan cycle (every ~2s).
+        Two exit triggers (either is enough to sell):
+
+        1. Fair-value alignment (primary):
+               current_mid >= live_fair_prob - exit_residual_edge
+           i.e. Polymarket has caught up to within exit_residual_edge (default 2¢)
+           of our fair-value estimate.  This captures the full reprice, not just
+           a flat bump.  Requires a live consensus price from the aggregator.
+
+        2. Flat take-profit (fallback / safety):
+               current_mid - entry_price >= exit_take_profit
+           Used when we have no live price (stale aggregator) or as an extra
+           safety net.  Disabled when exit_take_profit == 0.0.
 
         Skip exits if:
-          - exit_take_profit == 0.0 (disabled)
+          - Market is within exit_min_t_rem seconds of resolution (nearly over)
           - Position is a snipe with very little time left (let it resolve)
-          - Market is within exit_min_t_rem seconds of resolution
         """
-        if config.STRATEGY.exit_take_profit == 0.0:
-            return
+        from strategy.arbitrage import fair_prob_up  # local import to avoid circular
+
         if not self._positions:
             return
 
         for cid, pos in list(self._positions.items()):
-            # Find market to check time remaining
             market = self._cache.get_market(cid)
             t_rem = market.time_remaining_secs if market else 0.0
 
@@ -333,21 +351,47 @@ class OrderManager:
                 log.debug("Exit check: midpoint fetch failed %s: %s", cid[:8], exc)
                 continue
 
-            profit_per_share = current_mid - pos.entry_price
+            # ---- Trigger 1: fair-value alignment ----
+            should_exit = False
+            exit_reason = ""
+            if config.STRATEGY.exit_residual_edge > 0.0:
+                consensus = self._aggregator.consensus_price(pos.symbol)
+                if consensus is not None:
+                    vol = config.VOLATILITY.get(pos.symbol, config.DEFAULT_ANNUAL_VOL)
+                    p_up = fair_prob_up(consensus, pos.strike_price, t_rem, vol)
+                    fair = p_up if pos.bet == "Up" else (1.0 - p_up)
+                    residual = fair - current_mid
+                    if residual <= config.STRATEGY.exit_residual_edge:
+                        should_exit = True
+                        exit_reason = (
+                            f"fair-val fair={fair:.3f} mkt={current_mid:.3f} "
+                            f"residual={residual:.3f}"
+                        )
 
-            if profit_per_share < config.STRATEGY.exit_take_profit:
+            # ---- Trigger 2: flat take-profit fallback ----
+            if not should_exit and config.STRATEGY.exit_take_profit > 0.0:
+                profit_per_share = current_mid - pos.entry_price
+                if profit_per_share >= config.STRATEGY.exit_take_profit:
+                    should_exit = True
+                    exit_reason = (
+                        f"flat-tp entry={pos.entry_price:.4f} now={current_mid:.4f} "
+                        f"profit={profit_per_share:+.4f}"
+                    )
+
+            if not should_exit:
                 continue
 
-            # Take-profit threshold reached — sell
+            profit_per_share = current_mid - pos.entry_price
             total_profit_usdc = profit_per_share * pos.shares
             log.info(
                 "EXIT  %-3s  %s  %s  entry=%.4f  now=%.4f  "
-                "profit=+$%.2f (%.1f%%)  t_rem=%.0fs",
+                "profit=%+$.2f (%.1f%%)  t_rem=%.0fs  [%s]",
                 pos.symbol, cid[:8], pos.bet,
                 pos.entry_price, current_mid,
                 total_profit_usdc,
                 profit_per_share / pos.entry_price * 100,
                 t_rem,
+                exit_reason,
             )
             await self._sell_position(pos, current_mid)
 
@@ -391,6 +435,7 @@ class OrderManager:
         order_usdc: float,
         question: str,
         symbol: str,
+        strike_price: float,
         source: str,
         is_snipe: bool,
     ) -> None:
@@ -423,6 +468,7 @@ class OrderManager:
                 cost_usdc=order_usdc,
                 question=question,
                 symbol=symbol,
+                strike_price=strike_price,
                 is_snipe=is_snipe,
                 entered_at=time.monotonic(),
             )

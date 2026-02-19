@@ -131,8 +131,10 @@ class Bot:
         # 2. Load initial market list
         await self._market_cache.start()
 
-        # 3. Build order manager
-        self._order_manager = OrderManager(self._pm_client, self._market_cache)
+        # 3. Build order manager (aggregator wired in for fair-value exit)
+        self._order_manager = OrderManager(
+            self._pm_client, self._market_cache, self._aggregator
+        )
 
         # 4. Build strategies and wire into aggregator
         if self._use_momentum:
