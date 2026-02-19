@@ -181,15 +181,12 @@ class ArbStrategy:
             log.debug("Only 1 price source for %s — waiting for second feed.", symbol)
             return
 
-        # --- 2. Set / validate strike price ---
+        # --- 2. Validate strike price ---
+        # Strike is parsed from the question text at market discovery time
+        # (e.g. "$84,500" from "Will BTC be above $84,500 at 2:30 PM?").
+        # If it's missing the market was skipped at parse time — bail out.
         if market.strike_price is None:
-            # First time we see this market: record current price as strike
-            market.strike_price = consensus
-            log.info(
-                "Strike price set for %s (%s): %.2f",
-                cid[:8], market.question[:40], consensus,
-            )
-            return  # skip this cycle; let price develop first
+            return
 
         # --- 3. Check time remaining ---
         t_rem = market.time_remaining_secs
@@ -272,12 +269,15 @@ class ArbStrategy:
         src_str = "  ".join(f"{s}={p:.2f}" if p else f"{s}=stale"
                             for s, p in src_prices.items())
 
+        # e.g.: ARB  BTC  live=85200.00  strike=85000.00  buy=YES(above)
+        #             fair=0.581  mkt=0.500  edge=0.081  kelly=0.193  t_rem=487s
+        above_below = "above" if sig.market.direction == "UP" else "below"
         log.info(
-            "ARB  %s %-3s | buy=%-3s  fair=%.3f  mkt=%.3f  edge=%.3f  kelly=%.3f"
-            "  live=[%s]  strike=%.2f  t_rem=%.0fs",
-            sig.symbol, sig.market.direction,
+            "ARB  %s  live=%.2f  strike=%.2f (%s)  buy=%s"
+            "  fair=%.3f  mkt=%.3f  edge=%.3f  kelly=%.3f  t_rem=%.0fs  [%s]",
+            sig.symbol, sig.consensus_price, sig.strike_price, above_below,
             sig.side, sig.fair_prob, sig.market_prob, sig.edge, sig.kelly_f,
-            src_str, sig.strike_price, sig.market.time_remaining_secs,
+            sig.market.time_remaining_secs, src_str,
         )
 
         asyncio.create_task(self._on_signal(sig))

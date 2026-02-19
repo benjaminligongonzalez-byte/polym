@@ -35,12 +35,16 @@ PAPER_TRADE: bool = os.environ.get("PAPER_TRADE", "false").lower() == "true"
 # ---------------------------------------------------------------------------
 # Market filter — which Polymarket markets to trade
 # ---------------------------------------------------------------------------
-# Keywords found in the market question for 15-min crypto up/down bets.
+# Keywords that identify 15-min crypto up/down bet markets.
+# Polymarket uses multiple phrasings — cover them all.
+# Each entry must appear in the question text (case-insensitive).
 MARKET_KEYWORDS: list[str] = [
     "higher 15 minutes",
     "lower 15 minutes",
     "up in 15",
     "down in 15",
+    "above $",          # "Will BTC be above $84,500 at ..."
+    "below $",          # "Will BTC be below $3,200 at ..."
 ]
 
 # Crypto symbols we care about (must match text found in Polymarket questions)

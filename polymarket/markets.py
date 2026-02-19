@@ -51,8 +51,9 @@ class MarketInfo:
     yes_mid: float = 0.5
     no_mid: float = 0.5
     last_refresh: float = field(default_factory=time.monotonic)
-    # Strike price: the live crypto price recorded when we first discovered
-    # this market window. Used by the arb strategy as the reference price.
+    # Strike price: the fixed dollar price embedded in the market question
+    # (e.g. $84,500 in "Will BTC be above $84,500 at 2:30 PM?").
+    # Parsed once at discovery; never changes for the life of the window.
     strike_price: Optional[float] = None
 
     @property
@@ -80,9 +81,14 @@ class MarketInfo:
 # Discovery helpers
 # ---------------------------------------------------------------------------
 
+# Matches the fixed dollar strike in questions like "Will BTC be above $84,500.00?"
+# Handles optional commas and decimal places.
+_STRIKE_RE = re.compile(r'\$([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)')
+
+# "above" and "higher/up" both mean the YES outcome pays on a price increase
 _DIRECTION_PATTERNS = [
-    (re.compile(r"higher|up", re.I), "UP"),
-    (re.compile(r"lower|down", re.I), "DOWN"),
+    (re.compile(r"\babove\b|\bhigher\b|\bup\b", re.I), "UP"),
+    (re.compile(r"\bbelow\b|\blower\b|\bdown\b", re.I), "DOWN"),
 ]
 
 
@@ -98,6 +104,23 @@ def _parse_symbol(question: str) -> Optional[str]:
         if sym in question.upper():
             return sym
     return None
+
+
+def _parse_strike(question: str) -> Optional[float]:
+    """
+    Extract the fixed dollar strike price from the market question.
+
+    Examples:
+      "Will BTC be above $84,500 at 2:30 PM?"  → 84500.0
+      "Will ETH be below $3,200.50 in 15 min?" → 3200.5
+    """
+    match = _STRIKE_RE.search(question)
+    if not match:
+        return None
+    try:
+        return float(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
 
 
 def _is_15min_market(question: str) -> bool:
@@ -141,11 +164,15 @@ class MarketCache:
             new_cache: dict[str, MarketInfo] = {}
             for m in markets:
                 if m.condition_id in self._markets:
-                    # Preserve mutable state from existing entry
+                    # Preserve mutable runtime state from existing entry.
+                    # strike_price is parsed from the question so it stays
+                    # the same — no need to overwrite, but keep existing as
+                    # a fallback in case parse fails on re-fetch.
                     existing = self._markets[m.condition_id]
                     m.yes_mid = existing.yes_mid
                     m.no_mid = existing.no_mid
-                    m.strike_price = existing.strike_price  # keep recorded strike
+                    if m.strike_price is None:
+                        m.strike_price = existing.strike_price
                 new_cache[m.condition_id] = m
             self._markets = new_cache
             self._last_full_refresh = time.monotonic()
@@ -220,6 +247,11 @@ class MarketCache:
         if not yes_token_id or not no_token_id:
             return None
 
+        strike = _parse_strike(question)
+        if strike is None:
+            log.debug("Could not parse strike price from: %r — skipping.", question)
+            return None
+
         return MarketInfo(
             condition_id=condition_id,
             question=question,
@@ -228,6 +260,7 @@ class MarketCache:
             end_date_iso=end_date,
             yes_token=TokenInfo(token_id=yes_token_id, outcome="Yes"),
             no_token=TokenInfo(token_id=no_token_id, outcome="No"),
+            strike_price=strike,
         )
 
     # ------------------------------------------------------------------
