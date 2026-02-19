@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -490,8 +491,25 @@ def run(args: argparse.Namespace) -> None:
     cooldowns: dict[str, float] = {}
     cycle = 0
 
-    # In demo mode, prices drift each cycle
-    demo_prices = dict(_BASE_PRICES)
+    # Seed randomness — fixed seed gives reproducible runs, None = different each time
+    seed = args.seed if args.seed is not None else random.randint(0, 999_999)
+    random.seed(seed)
+
+    # In demo mode, start prices with a random ±2% offset from the base so each
+    # run begins at a slightly different level.
+    demo_prices = {
+        sym: px * random.uniform(0.980, 1.020)
+        for sym, px in _BASE_PRICES.items()
+    }
+
+    # Per-run randomised initial Polymarket lag: each market starts with a
+    # different amount of stale pricing so different edges are visible.
+    _run_markets = []
+    for tmpl in _DEMO_MARKETS_TEMPLATE:
+        lag_bias = random.uniform(-0.06, 0.10)   # negative = already priced in; positive = bigger lag
+        new_mid  = round(max(0.05, min(0.95, tmpl["up_mid_0"] + lag_bias)), 3)
+        _run_markets.append({**tmpl, "up_mid_0": new_mid})
+
     cycle_start = time.monotonic()
 
     # Simulated clock (seconds elapsed in the simulation).
@@ -505,7 +523,7 @@ def run(args: argparse.Namespace) -> None:
     print(f"\n{'═'*70}")
     print(f"  {BOLD}POLYMARKET PAPER-TRADING SIMULATOR{RESET}")
     mode_label = f"{YELLOW}DEMO (offline){RESET}" if args.demo else f"{GREEN}LIVE{RESET}"
-    print(f"  Mode: {mode_label}  |  Starting wallet: ${args.wallet:,.2f}")
+    print(f"  Mode: {mode_label}  |  Starting wallet: ${args.wallet:,.2f}  |  seed={seed}")
     print(f"  Strategy: Momentum + ARB + Late-window SNIPER")
     print(f"  Sniper window: final {SNIPE_WINDOW:.0f}s  |  min confidence: {SNIPE_MIN_PROB:.0%}")
     print(f"{'═'*70}\n")
@@ -522,10 +540,12 @@ def run(args: argparse.Namespace) -> None:
 
         # ── Fetch / update prices ─────────────────────────────────────────────
         if args.demo:
-            # Drift prices slightly to simulate market movement
+            # Drift prices using randomised Gaussian moves each cycle.
+            # Mean drift slightly positive (crypto upward bias); std scaled by
+            # per-symbol volatility so XRP/SOL move more than BTC.
             for sym in TARGET_SYMBOLS:
-                drift_dir = 1 if (cycle % 3 != 0) else -1  # mostly up, sometimes down
-                drift = _DRIFT_PCT[sym] * drift_dir * (1 + (cycle % 2) * 0.5)
+                vol_per_step = _DRIFT_PCT[sym] * 2.5
+                drift = random.gauss(vol_per_step * 0.3, vol_per_step)
                 demo_prices[sym] = demo_prices[sym] * (1 + drift)
             prices = demo_prices.copy()
         else:
@@ -545,15 +565,17 @@ def run(args: argparse.Namespace) -> None:
             # Advance each market's t_rem by SIM_STEP (simulated seconds per cycle)
             secs_passed = SIM_STEP
             markets = []
-            for tmpl in _DEMO_MARKETS_TEMPLATE:
+            for tmpl in _run_markets:
                 t_rem = max(0.0, tmpl["t_rem_0"] - (cycle - 1) * secs_passed)
-                # Polymarket mid drifts toward fair value slowly
                 sym = tmpl["symbol"]
                 p_live = prices.get(sym, tmpl["strike"])
                 vol = VOLATILITY.get(sym, DEFAULT_VOL)
                 fp = fair_prob_up(p_live, tmpl["strike"], max(t_rem, 5), vol)
-                # Market maker closes ~40% of the gap per cycle
-                current_up_mid = tmpl["up_mid_0"] + (fp - tmpl["up_mid_0"]) * 0.40 * max(cycle-1,0)
+                # Polymarket reprices at a randomised speed (25–55% of gap per cycle)
+                # plus small noise so the lag isn't perfectly smooth
+                reprice_speed = random.uniform(0.25, 0.55)
+                noise = random.gauss(0, 0.015)
+                current_up_mid = tmpl["up_mid_0"] + (fp - tmpl["up_mid_0"]) * reprice_speed * max(cycle-1, 0) + noise
                 current_up_mid = round(max(0.01, min(0.99, current_up_mid)), 3)
                 markets.append({**tmpl, "t_rem": t_rem, "up_mid": current_up_mid})
         else:
@@ -826,6 +848,8 @@ def run(args: argparse.Namespace) -> None:
     print(f"  Total portfolio:    ${total_value:,.2f}  ({pnl_col}{settled_pnl:+,.2f}{RESET})")
     print(f"{'═'*70}\n")
 
+    return total_value   # caller can chain ending balance into next run
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Entry point
@@ -839,10 +863,34 @@ def main() -> None:
     parser.add_argument("--cycles",   type=int,   default=999, help="Number of scan cycles")
     parser.add_argument("--interval", type=float, default=5.0, help="Seconds between cycles")
     parser.add_argument("--wallet",   type=float, default=1000.0, help="Starting USDC")
+    parser.add_argument("--runs",     type=int,   default=1,
+                        help="Number of consecutive runs; each run starts with the previous run's ending balance")
+    parser.add_argument("--seed",     type=int,   default=None,
+                        help="Random seed for reproducibility (default: random each run)")
     args = parser.parse_args()
 
     try:
-        run(args)
+        balance = args.wallet
+        for run_num in range(1, args.runs + 1):
+            if args.runs > 1:
+                print(f"\n{'▓'*70}")
+                print(f"  RUN {run_num} of {args.runs}  —  starting balance: ${balance:,.2f}")
+                print(f"{'▓'*70}")
+            run_args = argparse.Namespace(**vars(args))
+            run_args.wallet = balance
+            # Each run gets a fresh random seed (unless a fixed seed was given)
+            run_args.seed = args.seed  # None = pick new seed each run inside run()
+            ending = run(run_args)
+            balance = ending if ending is not None else balance
+
+        if args.runs > 1:
+            print(f"\n{'▓'*70}")
+            pnl = balance - args.wallet
+            pnl_col = GREEN if pnl >= 0 else RED
+            print(f"  {BOLD}ALL {args.runs} RUNS COMPLETE{RESET}")
+            print(f"  Starting wallet:  ${args.wallet:,.2f}")
+            print(f"  Final balance:    ${balance:,.2f}  ({pnl_col}{pnl:+,.2f}  {pnl/args.wallet*100:+.1f}%{RESET})")
+            print(f"{'▓'*70}\n")
     except KeyboardInterrupt:
         print("\n\n  [Ctrl+C] — Simulator stopped.")
 
