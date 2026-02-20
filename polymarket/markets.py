@@ -165,32 +165,46 @@ class MarketCache:
             log.error("Market refresh failed: %s", exc)
 
     async def _fetch_gamma_markets(self) -> list[MarketInfo]:
+        """Fetch current 15-min window markets by slug.
+
+        Slugs follow the pattern: {sym}-updown-15m-{epoch}
+        where epoch is the unix timestamp of the 15-min window start.
+        Boundaries fall at :00, :15, :30, :45 of every hour (every 900s).
+        We check the current and previous boundary to cover overlap.
+        """
+        now = int(time.time())
+        current_boundary = (now // 900) * 900
+        boundaries = [current_boundary, current_boundary - 900]
+
+        sym_slugs = {"BTC": "btc", "ETH": "eth", "XRP": "xrp", "SOL": "sol"}
+        raw_markets: list[dict] = []
+        seen_cids: set[str] = set()
+
+        for boundary in boundaries:
+            for sym, slug_sym in sym_slugs.items():
+                slug = f"{slug_sym}-updown-15m-{boundary}"
+                url = f"{config.GAMMA_API}/events/slug/{slug}"
+                try:
+                    async with self._session.get(url) as resp:
+                        if resp.status == 404:
+                            continue
+                        resp.raise_for_status()
+                        event = await resp.json()
+                    if isinstance(event, list):
+                        event = event[0] if event else {}
+                    for m in event.get("markets", []):
+                        cid = m.get("conditionId", "")
+                        if cid not in seen_cids:
+                            seen_cids.add(cid)
+                            raw_markets.append(m)
+                except Exception as exc:
+                    log.debug("Slug fetch failed for %s: %s", slug, exc)
+
         results: list[MarketInfo] = []
-        offset = 0
-        limit = 100
-
-        while True:
-            url = (
-                f"{config.GAMMA_API}/markets"
-                f"?active=true&closed=false&limit={limit}&offset={offset}"
-            )
-            async with self._session.get(url) as resp:
-                resp.raise_for_status()
-                data = await resp.json()
-
-            markets = data if isinstance(data, list) else data.get("markets", [])
-            if not markets:
-                break
-
-            for raw in markets:
-                m = self._parse_gamma_market(raw)
-                if m is not None:
-                    results.append(m)
-
-            if len(markets) < limit:
-                break
-            offset += limit
-
+        for raw in raw_markets:
+            m = self._parse_gamma_market(raw)
+            if m is not None:
+                results.append(m)
         return results
 
     @staticmethod

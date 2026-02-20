@@ -18,6 +18,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 CLOB_HOST = "https://clob.polymarket.com"
 GAMMA_API = "https://gamma-api.polymarket.com"
+DATA_API  = "https://data-api.polymarket.com"   # positions, trades, open interest
 
 # Chain ID: 137 = Polygon mainnet
 CHAIN_ID = 137
