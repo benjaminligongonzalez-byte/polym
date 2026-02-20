@@ -144,6 +144,31 @@ def _headers():
 # Cache: conditionId → opening price so we don't re-query Coinbase every cycle.
 _strike_cache: dict[str, float] = {}
 
+# Cache: tag ID for 15-min markets (discovered once at startup)
+_15min_tag_id: Optional[str] = None
+
+def _discover_15min_tag_id() -> Optional[str]:
+    """Fetch /tags and return the tag ID for 15-min crypto markets, or None."""
+    import requests
+    try:
+        resp = requests.get(f"{GAMMA_API}/tags", headers=_headers(), timeout=10)
+        resp.raise_for_status()
+        tags = resp.json()
+        if isinstance(tags, dict):
+            tags = tags.get("tags", tags.get("data", []))
+        # Look for a tag whose label/slug/name contains "15"
+        kws = ["15"]
+        for t in tags:
+            label = (t.get("label", "") + t.get("slug", "") + t.get("name", "")).lower()
+            if any(k in label for k in kws):
+                tid = t.get("id") or t.get("tag_id")
+                print(f"  {DIM}[debug] Found 15-min tag: {t.get('label','')} → id={tid}{RESET}")
+                return str(tid) if tid is not None else None
+        print(f"  {YELLOW}[debug] No 15-min tag found in {len(tags)} tags. Tag labels: {[t.get('label','?') for t in tags[:20]]}{RESET}")
+    except Exception as e:
+        print(f"  {YELLOW}[debug] Tag discovery failed: {e}{RESET}")
+    return None
+
 def live_open_price(symbol: str, start_iso: str) -> Optional[float]:
     """Return the Coinbase price of `symbol` at the start of a market window.
 
@@ -191,29 +216,63 @@ def live_prices() -> dict[str, float]:
     return prices
 
 def live_markets() -> list[dict]:
+    """Fetch active 15-min markets via the /events endpoint.
+
+    Strategy:
+      1. Discover the 15-min tag ID once (cached in _15min_tag_id).
+      2. If found, fetch only events with that tag — fast and targeted.
+      3. If not found, fall back to paginating all active events.
+    """
     import requests
-    resp = requests.get(
-        f"{GAMMA_API}/markets",
-        params={"active": "true", "closed": "false", "limit": 200},
-        headers=_headers(),
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    mkts = data if isinstance(data, list) else data.get("markets", [])
-    matched = [m for m in mkts if is_15min(m.get("question", m.get("title", "")))]
+    global _15min_tag_id
+
+    # Discover tag ID once per process lifetime
+    if _15min_tag_id is None:
+        _15min_tag_id = _discover_15min_tag_id() or ""
+
+    all_mkts: list[dict] = []
+    limit = 100
+    offset = 0
+
+    base_params: dict = {"active": "true", "closed": "false", "limit": limit}
+    if _15min_tag_id:
+        base_params["tag_id"] = _15min_tag_id
+
+    while True:
+        resp = requests.get(
+            f"{GAMMA_API}/events",
+            params={**base_params, "offset": offset},
+            headers=_headers(),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        events = resp.json()
+        if isinstance(events, dict):
+            events = events.get("events", events.get("data", []))
+        if not events:
+            break
+
+        for event in events:
+            for m in event.get("markets", []):
+                all_mkts.append(m)
+
+        if len(events) < limit:
+            break
+        offset += limit
+
+    matched = [m for m in all_mkts if is_15min(m.get("question", m.get("title", "")))]
+    tag_note = f"tag_id={_15min_tag_id}" if _15min_tag_id else "no tag (full scan)"
+    print(f"  {DIM}[debug] {tag_note}: {len(all_mkts)} markets scanned, {len(matched)} matched 15-min filter.{RESET}")
     if not matched:
-        print(f"  {YELLOW}[debug] Gamma API returned {len(mkts)} markets, 0 matched 15-min filter.{RESET}")
-        print(f"  {YELLOW}[debug] API keys in first market: {list(mkts[0].keys()) if mkts else 'NO MARKETS'}{RESET}")
         crypto_kw = ["btc", "eth", "xrp", "sol", "bitcoin", "ethereum", "solana", "ripple"]
-        crypto_mkts = [m for m in mkts if any(k in (m.get("question","") + m.get("title","")).lower() for k in crypto_kw)]
-        print(f"  {YELLOW}[debug] Crypto-related markets found: {len(crypto_mkts)}{RESET}")
+        crypto_mkts = [m for m in all_mkts if any(k in (m.get("question","") + m.get("title","")).lower() for k in crypto_kw)]
+        print(f"  {YELLOW}[debug] Crypto-related markets (not matching keyword filter): {len(crypto_mkts)}{RESET}")
         for m in crypto_mkts[:15]:
             q = m.get("question", m.get("title", ""))
             print(f"  {DIM}  → {q[:100]}{RESET}")
         if not crypto_mkts:
             print(f"  {YELLOW}[debug] First 10 markets (any topic):{RESET}")
-            for m in mkts[:10]:
+            for m in all_mkts[:10]:
                 q = m.get("question", m.get("title", ""))
                 print(f"  {DIM}  → {q[:100]}{RESET}")
     return matched
