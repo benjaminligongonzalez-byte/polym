@@ -34,7 +34,8 @@ CLOB_HOST    = "https://clob.polymarket.com"
 BINANCE_API  = "https://api.binance.us"
 
 MARKET_KEYWORDS = [
-    "up or down - 15",
+    "up or down",           # new format: "Bitcoin Up or Down - Jan 7, 10:45AM-11:00AM ET"
+    "up or down - 15",      # old format: "XRP Up or Down - 15 Minutes"
     "up or down - 15 min",
     "higher 15 minutes",
     "lower 15 minutes",

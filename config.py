@@ -39,7 +39,8 @@ PAPER_TRADE: bool = os.environ.get("PAPER_TRADE", "false").lower() == "true"
 # The primary live format is "XRP Up or Down - 15 Minutes".
 # Legacy phrasings are kept for backward compatibility.
 MARKET_KEYWORDS: list[str] = [
-    "up or down - 15",      # "XRP Up or Down - 15 Minutes"  ← primary format
+    "up or down",           # new format: "Bitcoin Up or Down - Jan 7, 10:45AM-11:00AM ET"
+    "up or down - 15",      # old format: "XRP Up or Down - 15 Minutes"
     "up or down - 15 min",  # variant
     "higher 15 minutes",    # legacy
     "lower 15 minutes",     # legacy
