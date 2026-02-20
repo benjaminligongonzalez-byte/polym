@@ -216,65 +216,62 @@ def live_prices() -> dict[str, float]:
     return prices
 
 def live_markets() -> list[dict]:
-    """Fetch active 15-min markets via the /events endpoint.
+    """Fetch the current 15-min window markets by slug.
 
-    Strategy:
-      1. Discover the 15-min tag ID once (cached in _15min_tag_id).
-      2. If found, fetch only events with that tag — fast and targeted.
-      3. If not found, fall back to paginating all active events.
+    Polymarket slugs follow the pattern: {sym}-updown-15m-{epoch}
+    where epoch is the unix timestamp (seconds) of the window start.
+    15-min boundaries fall at :00, :15, :30, :45 of every hour.
+
+    We check the current boundary and the previous one (overlap buffer).
+    This is O(8 requests) vs paginating thousands of events.
     """
     import requests
-    global _15min_tag_id
 
-    # Discover tag ID once per process lifetime
-    if _15min_tag_id is None:
-        _15min_tag_id = _discover_15min_tag_id() or ""
+    now = int(time.time())
+    # Current and previous 15-min boundary epochs
+    current_boundary = (now // 900) * 900
+    boundaries = [current_boundary, current_boundary - 900]
 
+    sym_slugs = {"BTC": "btc", "ETH": "eth", "XRP": "xrp", "SOL": "sol"}
     all_mkts: list[dict] = []
-    limit = 100
-    offset = 0
 
-    base_params: dict = {"active": "true", "closed": "false", "limit": limit}
-    if _15min_tag_id:
-        base_params["tag_id"] = _15min_tag_id
+    for boundary in boundaries:
+        for sym, slug_sym in sym_slugs.items():
+            slug = f"{slug_sym}-updown-15m-{boundary}"
+            try:
+                resp = requests.get(
+                    f"{GAMMA_API}/events/slug/{slug}",
+                    headers=_headers(),
+                    timeout=8,
+                )
+                if resp.status_code == 404:
+                    continue
+                resp.raise_for_status()
+                event = resp.json()
+                # Response may be an event dict or wrapped in a list
+                if isinstance(event, list):
+                    event = event[0] if event else {}
+                for m in event.get("markets", []):
+                    m.setdefault("_symbol", sym)
+                    all_mkts.append(m)
+            except Exception:
+                pass
 
-    while True:
-        resp = requests.get(
-            f"{GAMMA_API}/events",
-            params={**base_params, "offset": offset},
-            headers=_headers(),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        events = resp.json()
-        if isinstance(events, dict):
-            events = events.get("events", events.get("data", []))
-        if not events:
-            break
+    # Deduplicate by conditionId in case boundaries overlap
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for m in all_mkts:
+        cid = m.get("conditionId", m.get("condition_id", ""))
+        if cid not in seen:
+            seen.add(cid)
+            unique.append(m)
 
-        for event in events:
-            for m in event.get("markets", []):
-                all_mkts.append(m)
-
-        if len(events) < limit:
-            break
-        offset += limit
-
-    matched = [m for m in all_mkts if is_15min(m.get("question", m.get("title", "")))]
-    tag_note = f"tag_id={_15min_tag_id}" if _15min_tag_id else "no tag (full scan)"
-    print(f"  {DIM}[debug] {tag_note}: {len(all_mkts)} markets scanned, {len(matched)} matched 15-min filter.{RESET}")
-    if not matched:
-        crypto_kw = ["btc", "eth", "xrp", "sol", "bitcoin", "ethereum", "solana", "ripple"]
-        crypto_mkts = [m for m in all_mkts if any(k in (m.get("question","") + m.get("title","")).lower() for k in crypto_kw)]
-        print(f"  {YELLOW}[debug] Crypto-related markets (not matching keyword filter): {len(crypto_mkts)}{RESET}")
-        for m in crypto_mkts[:15]:
-            q = m.get("question", m.get("title", ""))
-            print(f"  {DIM}  → {q[:100]}{RESET}")
-        if not crypto_mkts:
-            print(f"  {YELLOW}[debug] First 10 markets (any topic):{RESET}")
-            for m in all_mkts[:10]:
-                q = m.get("question", m.get("title", ""))
-                print(f"  {DIM}  → {q[:100]}{RESET}")
+    matched = [m for m in unique if is_15min(m.get("question", m.get("title", "")))]
+    print(f"  {DIM}[debug] slug lookup: {len(unique)} markets found, {len(matched)} matched 15-min filter.{RESET}")
+    if not matched and unique:
+        print(f"  {YELLOW}[debug] Titles returned (not matching filter):{RESET}")
+        for m in unique[:8]:
+            print(f"  {DIM}  → {m.get('question', m.get('title', ''))[:100]}{RESET}")
     return matched
 
 def live_midpoint(token_id: str) -> Optional[float]:
