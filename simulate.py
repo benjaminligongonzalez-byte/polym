@@ -140,6 +140,42 @@ def _headers():
         "Referer": "https://polymarket.com/",
     }
 
+# Cache: conditionId → opening price so we don't re-query Coinbase every cycle.
+_strike_cache: dict[str, float] = {}
+
+def live_open_price(symbol: str, start_iso: str) -> Optional[float]:
+    """Return the Coinbase price of `symbol` at the start of a market window.
+
+    Polymarket's "BTC Up or Down - 15 min" markets use the price at
+    `startDate` as the strike.  We fetch the 1-minute candle that opens at
+    (or just after) that timestamp and take its open price.
+    """
+    import requests
+    from datetime import timedelta
+    product = {"BTC": "BTC-USD", "ETH": "ETH-USD",
+               "XRP": "XRP-USD", "SOL": "SOL-USD"}.get(symbol)
+    if not product or not start_iso:
+        return None
+    try:
+        start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+        end_dt   = start_dt + timedelta(minutes=3)
+        resp = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product}/candles",
+            params={
+                "start": start_dt.isoformat(),
+                "end":   end_dt.isoformat(),
+                "granularity": 60,
+            },
+            timeout=5,
+        )
+        resp.raise_for_status()
+        candles = resp.json()   # [[time, low, high, open, close, vol], ...]
+        if candles:
+            return float(candles[-1][3])   # open of the earliest candle
+    except Exception:
+        pass
+    return None
+
 def live_prices() -> dict[str, float]:
     import requests
     products = {"BTC-USD": "BTC", "ETH-USD": "ETH", "XRP-USD": "XRP", "SOL-USD": "SOL"}
@@ -642,34 +678,87 @@ def run(args: argparse.Namespace) -> None:
                 continue
             markets = []
             skipped_reasons: dict[str, int] = {}
+            _UP_LABELS   = {"up", "yes", "higher", "above"}
+            _DOWN_LABELS = {"down", "no", "lower", "below"}
             for m in raw_markets:
                 q = m.get("question", m.get("title", ""))
                 sym = parse_symbol(q)
                 if sym not in prices:
                     skipped_reasons["no_symbol"] = skipped_reasons.get("no_symbol", 0) + 1
                     continue
+
+                cid = m.get("conditionId", m.get("condition_id", q))
+
+                # Strike: try dollar amount in text first; fall back to the
+                # Coinbase opening price at startDate (used by "X Up or Down - 15 min"
+                # markets where the strike IS the price when the window opened).
                 strike = parse_strike(q, m.get("description", ""))
                 if strike is None:
+                    if cid in _strike_cache:
+                        strike = _strike_cache[cid]
+                    else:
+                        strike = live_open_price(sym, m.get("startDate", ""))
+                        if strike is None:
+                            # Last resort: current live price (less accurate but
+                            # lets the bot trade rather than dropping the market)
+                            strike = prices.get(sym)
+                        if strike is not None:
+                            _strike_cache[cid] = strike
+                if strike is None:
                     skipped_reasons["no_strike"] = skipped_reasons.get("no_strike", 0) + 1
-                    print(f"  {DIM}[debug] no strike in: {q[:80]}{RESET}")
                     continue
+
                 t_rem = secs_until(m.get("endDate", m.get("end_date_iso", "")))
+
+                # Token IDs: Gamma API returns either a tokens[] array OR
+                # clobTokenIds + outcomes as JSON-encoded strings.
                 tokens = m.get("tokens", [])
-                # Accept a broad set of outcome labels used by Polymarket
-                _UP_LABELS   = {"up", "yes", "higher", "above"}
-                _DOWN_LABELS = {"down", "no", "lower", "below"}
                 up_tok = next((t["token_id"] for t in tokens
                                if t.get("outcome", "").lower() in _UP_LABELS), None)
                 dn_tok = next((t["token_id"] for t in tokens
                                if t.get("outcome", "").lower() in _DOWN_LABELS), None)
+
+                if not up_tok or not dn_tok:
+                    # Fallback: parse clobTokenIds + outcomes (alternate Gamma format)
+                    try:
+                        clob_raw = m.get("clobTokenIds", "[]")
+                        out_raw  = m.get("outcomes", "[]")
+                        clob_ids = json.loads(clob_raw) if isinstance(clob_raw, str) else clob_raw
+                        outcomes_list = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+                        for tid, outcome in zip(clob_ids, outcomes_list):
+                            ol = outcome.lower()
+                            if ol in _UP_LABELS:
+                                up_tok = tid
+                            elif ol in _DOWN_LABELS:
+                                dn_tok = tid
+                    except Exception:
+                        pass
+
                 if not up_tok or not dn_tok:
                     skipped_reasons["no_tokens"] = skipped_reasons.get("no_tokens", 0) + 1
-                    outcomes = [t.get("outcome","?") for t in tokens]
-                    print(f"  {DIM}[debug] unrecognised token outcomes {outcomes} in: {q[:60]}{RESET}")
+                    all_outcomes = ([t.get("outcome","?") for t in tokens]
+                                    or [m.get("outcomes","?")])
+                    print(f"  {DIM}[debug] no Up/Down tokens {all_outcomes} in: {q[:60]}{RESET}")
                     continue
-                up_mid = live_midpoint(up_tok) or 0.5
+
+                # Midpoint: prefer CLOB live_midpoint; fall back to outcomePrices
+                up_mid = live_midpoint(up_tok)
+                if up_mid is None:
+                    try:
+                        px_raw = m.get("outcomePrices", "[]")
+                        out_raw = m.get("outcomes", "[]")
+                        px_list  = json.loads(px_raw) if isinstance(px_raw, str) else px_raw
+                        out_list = json.loads(out_raw) if isinstance(out_raw, str) else out_raw
+                        for outcome, px in zip(out_list, px_list):
+                            if outcome.lower() in _UP_LABELS:
+                                up_mid = float(px)
+                    except Exception:
+                        pass
+                if up_mid is None:
+                    up_mid = 0.5
+
                 markets.append({
-                    "cid": m.get("conditionId", m.get("condition_id", q)),
+                    "cid": cid,
                     "question": q, "symbol": sym, "strike": strike,
                     "t_rem": t_rem, "up_mid": up_mid,
                     "up_token": up_tok, "down_token": dn_tok,
