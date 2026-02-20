@@ -164,7 +164,12 @@ def live_markets() -> list[dict]:
     resp.raise_for_status()
     data = resp.json()
     mkts = data if isinstance(data, list) else data.get("markets", [])
-    return [m for m in mkts if is_15min(m.get("question", m.get("title", "")))]
+    matched = [m for m in mkts if is_15min(m.get("question", m.get("title", "")))]
+    if not matched:
+        print(f"  {YELLOW}[debug] Gamma API returned {len(mkts)} markets, 0 matched 15-min filter.{RESET}")
+        for m in mkts[:10]:
+            print(f"  {DIM}  → {m.get('question', m.get('title', ''))[:90]}{RESET}")
+    return matched
 
 def live_midpoint(token_id: str) -> Optional[float]:
     import requests
