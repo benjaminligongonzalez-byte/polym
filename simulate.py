@@ -204,8 +204,18 @@ def live_markets() -> list[dict]:
     matched = [m for m in mkts if is_15min(m.get("question", m.get("title", "")))]
     if not matched:
         print(f"  {YELLOW}[debug] Gamma API returned {len(mkts)} markets, 0 matched 15-min filter.{RESET}")
-        for m in mkts[:10]:
-            print(f"  {DIM}  → {m.get('question', m.get('title', ''))[:90]}{RESET}")
+        print(f"  {YELLOW}[debug] API keys in first market: {list(mkts[0].keys()) if mkts else 'NO MARKETS'}{RESET}")
+        crypto_kw = ["btc", "eth", "xrp", "sol", "bitcoin", "ethereum", "solana", "ripple"]
+        crypto_mkts = [m for m in mkts if any(k in (m.get("question","") + m.get("title","")).lower() for k in crypto_kw)]
+        print(f"  {YELLOW}[debug] Crypto-related markets found: {len(crypto_mkts)}{RESET}")
+        for m in crypto_mkts[:15]:
+            q = m.get("question", m.get("title", ""))
+            print(f"  {DIM}  → {q[:100]}{RESET}")
+        if not crypto_mkts:
+            print(f"  {YELLOW}[debug] First 10 markets (any topic):{RESET}")
+            for m in mkts[:10]:
+                q = m.get("question", m.get("title", ""))
+                print(f"  {DIM}  → {q[:100]}{RESET}")
     return matched
 
 def live_midpoint(token_id: str) -> Optional[float]:
