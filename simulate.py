@@ -31,7 +31,7 @@ from typing import Optional
 
 GAMMA_API    = "https://gamma-api.polymarket.com"
 CLOB_HOST    = "https://clob.polymarket.com"
-BINANCE_API  = "https://api.binance.com"
+BINANCE_API  = "https://api.binance.us"
 
 MARKET_KEYWORDS = [
     "up or down - 15",
