@@ -142,19 +142,16 @@ def _headers():
 
 def live_prices() -> dict[str, float]:
     import requests
-    resp = requests.get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": "bitcoin,ethereum,ripple,solana", "vs_currencies": "usd"},
-        timeout=5,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return {
-        "BTC": float(data["bitcoin"]["usd"]),
-        "ETH": float(data["ethereum"]["usd"]),
-        "XRP": float(data["ripple"]["usd"]),
-        "SOL": float(data["solana"]["usd"]),
-    }
+    products = {"BTC-USD": "BTC", "ETH-USD": "ETH", "XRP-USD": "XRP", "SOL-USD": "SOL"}
+    prices = {}
+    for product, sym in products.items():
+        resp = requests.get(
+            f"https://api.exchange.coinbase.com/products/{product}/ticker",
+            timeout=5,
+        )
+        resp.raise_for_status()
+        prices[sym] = float(resp.json()["price"])
+    return prices
 
 def live_markets() -> list[dict]:
     import requests
