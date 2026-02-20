@@ -641,21 +641,31 @@ def run(args: argparse.Namespace) -> None:
                 time.sleep(args.interval)
                 continue
             markets = []
+            skipped_reasons: dict[str, int] = {}
             for m in raw_markets:
                 q = m.get("question", m.get("title", ""))
                 sym = parse_symbol(q)
                 if sym not in prices:
+                    skipped_reasons["no_symbol"] = skipped_reasons.get("no_symbol", 0) + 1
                     continue
                 strike = parse_strike(q, m.get("description", ""))
                 if strike is None:
+                    skipped_reasons["no_strike"] = skipped_reasons.get("no_strike", 0) + 1
+                    print(f"  {DIM}[debug] no strike in: {q[:80]}{RESET}")
                     continue
                 t_rem = secs_until(m.get("endDate", m.get("end_date_iso", "")))
                 tokens = m.get("tokens", [])
+                # Accept a broad set of outcome labels used by Polymarket
+                _UP_LABELS   = {"up", "yes", "higher", "above"}
+                _DOWN_LABELS = {"down", "no", "lower", "below"}
                 up_tok = next((t["token_id"] for t in tokens
-                               if t.get("outcome", "").lower() in ("up","yes")), None)
+                               if t.get("outcome", "").lower() in _UP_LABELS), None)
                 dn_tok = next((t["token_id"] for t in tokens
-                               if t.get("outcome", "").lower() in ("down","no")), None)
+                               if t.get("outcome", "").lower() in _DOWN_LABELS), None)
                 if not up_tok or not dn_tok:
+                    skipped_reasons["no_tokens"] = skipped_reasons.get("no_tokens", 0) + 1
+                    outcomes = [t.get("outcome","?") for t in tokens]
+                    print(f"  {DIM}[debug] unrecognised token outcomes {outcomes} in: {q[:60]}{RESET}")
                     continue
                 up_mid = live_midpoint(up_tok) or 0.5
                 markets.append({
@@ -664,6 +674,8 @@ def run(args: argparse.Namespace) -> None:
                     "t_rem": t_rem, "up_mid": up_mid,
                     "up_token": up_tok, "down_token": dn_tok,
                 })
+            if skipped_reasons:
+                print(f"  {YELLOW}[debug] dropped {sum(skipped_reasons.values())} markets: {skipped_reasons}{RESET}")
 
         # ── Settle expired positions ──────────────────────────────────────────
         # In demo mode use sim_now; in live mode use real time.
