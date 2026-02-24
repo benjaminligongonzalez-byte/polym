@@ -226,8 +226,12 @@ async def main(args: argparse.Namespace) -> None:
         log.info("Received %s — initiating shutdown.", sig.name)
         loop.create_task(bot.stop())
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _shutdown, sig)
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, _shutdown, sig)
+    else:
+        # Windows doesn't support add_signal_handler; use signal.signal for Ctrl+C
+        signal.signal(signal.SIGINT, lambda s, f: loop.create_task(bot.stop()))
 
     try:
         await bot.start()
