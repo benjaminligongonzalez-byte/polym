@@ -20,15 +20,14 @@ from typing import Callable, Awaitable
 
 import websockets
 
+import config
+
 log = logging.getLogger(__name__)
 
 COINBASE_WS_URL = "wss://ws-feed.exchange.coinbase.com"
 
-# Coinbase product → our canonical symbol
-PRODUCT_SYMBOL_MAP: dict[str, str] = {
-    "BTC-USD": "BTC",
-    "ETH-USD": "ETH",
-}
+# Coinbase product → our canonical symbol (defined centrally in config)
+PRODUCT_SYMBOL_MAP: dict[str, str] = config.COINBASE_SYMBOL_MAP
 
 RECONNECT_DELAY_BASE = 1.0
 RECONNECT_DELAY_MAX = 30.0
@@ -69,7 +68,7 @@ class CoinbaseFeed:
                     # Subscribe to ticker channel for all target products
                     sub = {
                         "type": "subscribe",
-                        "product_ids": list(PRODUCT_SYMBOL_MAP.keys()),
+                        "product_ids": config.COINBASE_PRODUCTS,
                         "channels": ["ticker"],
                     }
                     await ws.send(json.dumps(sub))
