@@ -107,8 +107,15 @@ class OrderManager:
     # ------------------------------------------------------------------
 
     async def refresh_balance(self) -> None:
-        """Fetch live USDC balance and cache it."""
-        balance = await self._client.get_usdc_balance()
+        """Fetch live USDC balance and cache it.
+
+        In paper trade mode a virtual balance is used so sizing works even
+        when the wallet holds no real USDC.
+        """
+        if config.PAPER_TRADE:
+            balance = config.PAPER_BALANCE_USDC
+        else:
+            balance = await self._client.get_usdc_balance()
         changed = abs(balance - self._wallet_balance) > 0.01
         self._wallet_balance = balance
         now = time.monotonic()

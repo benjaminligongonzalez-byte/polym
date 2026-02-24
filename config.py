@@ -32,6 +32,8 @@ CLOB_SECRET: str = os.environ.get("CLOB_SECRET", "")
 CLOB_PASS_PHRASE: str = os.environ.get("CLOB_PASS_PHRASE", "")
 FUNDER_ADDRESS: str = os.environ.get("FUNDER_ADDRESS", "")
 PAPER_TRADE: bool = os.environ.get("PAPER_TRADE", "false").lower() == "true"
+# Virtual USDC balance used when PAPER_TRADE=true (real wallet not needed)
+PAPER_BALANCE_USDC: float = float(os.environ.get("PAPER_BALANCE_USDC", "1000"))
 
 # ---------------------------------------------------------------------------
 # Market filter — which Polymarket markets to trade
