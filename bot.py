@@ -125,8 +125,9 @@ class Bot:
             config.STRATEGY.lookback_secs,
         )
 
-        # 1. Connect to Polymarket CLOB
+        # 1. Connect to Polymarket CLOB and print auth summary
         await self._pm_client.connect()
+        await self._pm_client.auth_banner()
 
         # 2. Load initial market list
         await self._market_cache.start()

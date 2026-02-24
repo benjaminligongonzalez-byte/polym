@@ -89,6 +89,30 @@ class PolymarketClient:
         self._client = await self._loop.run_in_executor(None, _build_sync_client)
         log.info("PolymarketClient connected (paper_trade=%s).", config.PAPER_TRADE)
 
+    async def auth_banner(self) -> None:
+        """Log a startup summary: wallet address, API key, and USDC balance."""
+        try:
+            from eth_account import Account
+            address = Account.from_key(
+                config.PK if not config.PK.startswith("0x") else config.PK[2:]
+            ).address
+        except Exception:
+            address = "(unknown)"
+
+        balance = await self.get_usdc_balance()
+        key_hint = (config.CLOB_API_KEY[:8] + "…") if config.CLOB_API_KEY else "(derived)"
+        mode = "PAPER (no real orders)" if config.PAPER_TRADE else "LIVE  *** REAL MONEY ***"
+
+        log.info("─" * 60)
+        log.info("  Wallet  : %s", address)
+        log.info("  API key : %s", key_hint)
+        log.info("  Balance : $%.4f USDC", balance)
+        log.info("  Mode    : %s", mode)
+        log.info("─" * 60)
+
+        if not config.PAPER_TRADE and balance < 5.0:
+            log.warning("Low balance ($%.2f) — live trading may fail.", balance)
+
     # ------------------------------------------------------------------
     # Market data
     # ------------------------------------------------------------------
