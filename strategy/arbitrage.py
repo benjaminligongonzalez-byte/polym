@@ -208,7 +208,14 @@ class ArbStrategy:
 
         # --- 2. Strike check ---
         if market.strike_price is None:
-            return
+            # "Up or Down" directional market: no fixed $ strike in the title.
+            # Lock in the current live price as the opening strike on first tick.
+            # This is permanent — subsequent ticks use this cached value.
+            market.strike_price = consensus
+            log.info(
+                "Up/Down %s (%s): opening strike locked at $%.4f",
+                symbol, market.question[:35], consensus,
+            )
 
         # --- 3. Time check ---
         t_rem = market.time_remaining_secs

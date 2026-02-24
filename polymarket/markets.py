@@ -86,10 +86,23 @@ _STRIKE_RE = re.compile(
 )
 
 
+_SYMBOL_FULL_NAMES: dict[str, str] = {
+    "BITCOIN": "BTC",
+    "ETHEREUM": "ETH",
+    "SOLANA": "SOL",
+    "RIPPLE": "XRP",
+}
+
+
 def _parse_symbol(text: str) -> Optional[str]:
     upper = text.upper()
+    # Direct ticker match (e.g. "XRP", "ETH" also found inside "ETHEREUM")
     for sym in config.TARGET_SYMBOLS:
         if sym in upper:
+            return sym
+    # Full-name match for tickers not found as substrings (e.g. "BITCOIN" → "BTC")
+    for name, sym in _SYMBOL_FULL_NAMES.items():
+        if name in upper:
             return sym
     return None
 
@@ -232,12 +245,11 @@ class MarketCache:
         condition_id: str = raw.get("conditionId", "")
         end_date: str = raw.get("endDate", "")
 
-        # Strike ("Price to Beat") — check description first, then question
+        # Strike ("Price to Beat") — check description first, then question.
+        # New-style "Up or Down" markets have no fixed $ strike; strike_price
+        # stays None and the arb strategy will lock in the live price on first tick.
         description: str = raw.get("description", "") or ""
         strike = _parse_strike(question, description)
-        if strike is None:
-            log.debug("No strike price found for: %r — skipping.", question)
-            return None
 
         # Token IDs — outcomes are "Up" / "Down" for these markets.
         # Fall back to "Yes" / "No" for old-style markets.
