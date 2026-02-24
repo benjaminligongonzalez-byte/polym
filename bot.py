@@ -108,10 +108,10 @@ class Bot:
             config.PAPER_TRADE, self._use_momentum, self._use_arb,
         )
         log.info(
-            "Risk: order=$%.0f–$%.0f  max_exposure=$%.0f  kelly=%.2f",
+            "Risk: order=$%.0f–$%.0f  max_exposure=%.0f%%  kelly=%.2f",
             config.RISK.min_order_usdc,
-            config.RISK.max_order_usdc,
-            config.RISK.max_total_exposure_usdc,
+            config.RISK.max_order_usdc_hard,
+            config.RISK.max_exposure_fraction * 100,
             config.STRATEGY.kelly_fraction,
         )
         log.info(
