@@ -18,6 +18,7 @@ The token outcomes are literally "Up" and "Down" in the Gamma API response.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -128,6 +129,19 @@ def _parse_strike(question: str, description: str = "") -> Optional[float]:
 
 def _is_15min_market(question: str) -> bool:
     return any(kw.lower() in question.lower() for kw in config.MARKET_KEYWORDS)
+
+
+def _parse_json_list(val) -> list:
+    """Return val as a list, JSON-decoding it first if it's a string."""
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            result = json.loads(val)
+            return result if isinstance(result, list) else []
+        except (json.JSONDecodeError, ValueError):
+            return []
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -251,19 +265,38 @@ class MarketCache:
         description: str = raw.get("description", "") or ""
         strike = _parse_strike(question, description)
 
-        # Token IDs — outcomes are "Up" / "Down" for these markets.
-        # Fall back to "Yes" / "No" for old-style markets.
-        tokens: list[dict] = raw.get("tokens", []) or raw.get("clobTokenIds", [])
+        # Token IDs — two formats depending on which endpoint returned the market:
+        #
+        # Structured (CLOB markets endpoint):
+        #   tokens = [{"token_id": "...", "outcome": "Up"}, ...]
+        #
+        # Flat (Gamma events/slug endpoint):
+        #   clobTokenIds = '["tok1", "tok2"]'  ← JSON-encoded string
+        #   outcomes     = '["Up", "Down"]'    ← JSON-encoded string
+        #
         up_token_id = ""
         down_token_id = ""
 
-        for t in tokens:
-            outcome = t.get("outcome", "").lower()
-            tid = t.get("token_id", t.get("tokenId", ""))
-            if outcome in ("up", "yes"):
-                up_token_id = tid
-            elif outcome in ("down", "no"):
-                down_token_id = tid
+        tokens_raw = raw.get("tokens", [])
+        if tokens_raw and isinstance(tokens_raw, list) and isinstance(tokens_raw[0], dict):
+            # Structured format
+            for t in tokens_raw:
+                outcome = t.get("outcome", "").lower()
+                tid = t.get("token_id", t.get("tokenId", ""))
+                if outcome in ("up", "yes"):
+                    up_token_id = tid
+                elif outcome in ("down", "no"):
+                    down_token_id = tid
+        else:
+            # Flat format — clobTokenIds and outcomes are JSON-encoded strings
+            clob_ids = _parse_json_list(raw.get("clobTokenIds", []))
+            outcomes  = _parse_json_list(raw.get("outcomes", []))
+            for outcome, tid in zip(outcomes, clob_ids):
+                ol = outcome.lower()
+                if ol in ("up", "yes"):
+                    up_token_id = tid
+                elif ol in ("down", "no"):
+                    down_token_id = tid
 
         if not up_token_id or not down_token_id:
             log.debug("Missing Up/Down token IDs for: %r — skipping.", question)
