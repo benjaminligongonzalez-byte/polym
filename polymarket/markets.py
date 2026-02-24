@@ -187,18 +187,28 @@ class MarketCache:
                 try:
                     async with self._session.get(url) as resp:
                         if resp.status == 404:
+                            log.debug("Slug 404: %s", slug)
                             continue
                         resp.raise_for_status()
                         event = await resp.json()
                     if isinstance(event, list):
                         event = event[0] if event else {}
-                    for m in event.get("markets", []):
+                    mkts = event.get("markets", [])
+                    log.info("Slug hit: %s → %d market(s)", slug, len(mkts))
+                    for m in mkts:
                         cid = m.get("conditionId", "")
                         if cid not in seen_cids:
                             seen_cids.add(cid)
                             raw_markets.append(m)
                 except Exception as exc:
-                    log.debug("Slug fetch failed for %s: %s", slug, exc)
+                    log.warning("Slug fetch error for %s: %s", slug, exc)
+
+        if not raw_markets:
+            log.warning("Slug lookup: all slugs returned 404 — no active 15-min markets found.")
+        else:
+            log.info("Slug lookup: %d raw markets before filtering.", len(raw_markets))
+            for r in raw_markets[:8]:
+                log.info("  question: %r", r.get("question", r.get("title", "(no question)")))
 
         results: list[MarketInfo] = []
         for raw in raw_markets:
