@@ -121,6 +121,16 @@ class TraderTracker:
         self._question_cache: dict[str, str]   = {}  # condition_id → question
         self._token_labels:   dict[str, str]   = {}  # token_id     → "Up"/"Down"
 
+        # Adaptive CLOB bypass: if CLOB returns 0 for _CLOB_SKIP_AFTER consecutive
+        # polls, skip CLOB for _CLOB_SKIP_POLLS polls before retrying.
+        # Proxy-wallet users always get 0 from CLOB — no point hammering it.
+        _CLOB_SKIP_AFTER = 10     # give up after 10 empty results (~20 s)
+        _CLOB_SKIP_POLLS = 300    # skip for 300 polls (~10 min) then retry
+        self._clob_empty_streak: int = 0
+        self._clob_skip_remaining: int = 0
+        self._CLOB_SKIP_AFTER = _CLOB_SKIP_AFTER
+        self._CLOB_SKIP_POLLS = _CLOB_SKIP_POLLS
+
         # Aggregated position view: token_id → net shares (+ = long, − = sold)
         self._net_shares: dict[str, float] = {}
         # token_id → question (for display in status_report)
@@ -225,20 +235,45 @@ class TraderTracker:
         """
         Fetch recent trades; try CLOB API first (lowest indexing latency —
         trades appear here the moment they match), Data API as fallback.
+
+        Adaptive bypass: if CLOB returns 0 for _CLOB_SKIP_AFTER consecutive
+        polls it is skipped for _CLOB_SKIP_POLLS polls before being retried.
+        This handles proxy-wallet users where CLOB never returns the target's
+        fills, eliminating a wasted request pair every poll cycle.
         """
-        try:
-            result = await self._fetch_clob_api()
-            if result:
-                log.debug("Tracker: CLOB API returned %d trades", len(result))
-                return result
-            log.debug("Tracker: CLOB API returned 0 trades — falling back to Data API")
-        except Exception as exc:
-            log.debug("Tracker: CLOB API error (%s) — trying Data API", exc)
+        use_clob = True
+        if self._clob_skip_remaining > 0:
+            self._clob_skip_remaining -= 1
+            use_clob = False
+
+        if use_clob:
+            try:
+                result = await self._fetch_clob_api()
+                if result:
+                    log.debug("Tracker: CLOB API returned %d trades", len(result))
+                    self._clob_empty_streak = 0  # reset — CLOB is working
+                    return result
+                # CLOB returned nothing
+                self._clob_empty_streak += 1
+                if self._clob_empty_streak >= self._CLOB_SKIP_AFTER:
+                    self._clob_skip_remaining = self._CLOB_SKIP_POLLS
+                    self._clob_empty_streak   = 0
+                    log.info(
+                        "Tracker: CLOB empty for %d polls — target likely uses proxy wallet. "
+                        "Skipping CLOB for next %d polls (~%g min) to reduce wasted requests.",
+                        self._CLOB_SKIP_AFTER,
+                        self._CLOB_SKIP_POLLS,
+                        round(self._CLOB_SKIP_POLLS * config.TRACKER_POLL_SECS / 60, 1),
+                    )
+                else:
+                    log.debug("Tracker: CLOB API returned 0 trades — falling back to Data API")
+            except Exception as exc:
+                log.debug("Tracker: CLOB API error (%s) — trying Data API", exc)
 
         try:
             result = await self._fetch_data_api()
             if result is not None:
-                log.debug("Tracker: Data API returned %d trades (CLOB was empty)", len(result))
+                log.debug("Tracker: Data API returned %d trades", len(result))
                 return result
         except Exception as exc:
             log.debug("Tracker: Data API also failed: %s", exc)
