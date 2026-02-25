@@ -749,7 +749,7 @@ class OrderManager:
         """
         from strategy.arbitrage import fair_prob_up  # local import to avoid circular
 
-        if not self._positions:
+        if not self._positions and not self._blind_positions:
             return
 
         for cid, pos in list(self._positions.items()):
