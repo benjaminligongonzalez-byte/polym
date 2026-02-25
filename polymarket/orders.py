@@ -58,13 +58,14 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # ── ANSI colour constants (terminal display) ──────────────────────────────────
-_RESET  = "\033[0m"
-_BOLD   = "\033[1m"
-_DIM    = "\033[2m"
-_GREEN  = "\033[92m"
-_RED    = "\033[91m"
-_YELLOW = "\033[93m"
-_CYAN   = "\033[96m"
+_RESET   = "\033[0m"
+_BOLD    = "\033[1m"
+_DIM     = "\033[2m"
+_GREEN   = "\033[92m"
+_RED     = "\033[91m"
+_YELLOW  = "\033[93m"
+_CYAN    = "\033[96m"
+_MAGENTA = "\033[95m"
 _ORANGE = "\033[33m"
 
 
