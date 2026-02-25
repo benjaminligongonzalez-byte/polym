@@ -88,6 +88,9 @@ class ClobFeed:
         # WebSocket connection reference (held while connected)
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._running = False
+        # Optional sync callback fired on last_trade_price events (token_id → None)
+        # Used to wake the tracker immediately when market activity is detected.
+        self._on_trade_activity: Callable[[str], None] | None = None
         # Stats
         self._events_received = 0
         self._connected_at: float = 0.0
@@ -95,6 +98,14 @@ class ClobFeed:
     # ------------------------------------------------------------------
     # Subscription management
     # ------------------------------------------------------------------
+
+    def set_trade_activity_callback(self, cb: Callable[[str], None]) -> None:
+        """
+        Register a sync callback fired on every last_trade_price event.
+        The callback receives the token_id of the market that just traded.
+        Used to wake the copy-trade tracker immediately on market activity.
+        """
+        self._on_trade_activity = cb
 
     def update_subscriptions(self, token_ids: list[str]) -> None:
         """
@@ -239,6 +250,14 @@ class ClobFeed:
                     await self._on_update(token_id, mid)
                 except Exception as exc:
                     log.debug("ClobFeed: on_update error: %s", exc)
+
+            # Fire the trade-activity callback on last_trade_price events so the
+            # tracker can interrupt its sleep and poll the Data API immediately.
+            if etype == "last_trade_price" and self._on_trade_activity is not None:
+                try:
+                    self._on_trade_activity(token_id)
+                except Exception as exc:
+                    log.debug("ClobFeed: on_trade_activity error: %s", exc)
 
     # ------------------------------------------------------------------
     # Status

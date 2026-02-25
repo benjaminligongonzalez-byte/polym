@@ -697,6 +697,9 @@ class OrderManager:
             )
             if resp is not None:
                 self._blind_positions.remove(pos)
+                if config.PAPER_TRADE:
+                    self._paper_pnl += pnl
+                    self._wallet_balance = config.PAPER_BALANCE_USDC + self._paper_pnl
                 self._closed_trades.append(ClosedTrade(
                     condition_id=pos.condition_id,
                     symbol=pos.symbol,

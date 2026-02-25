@@ -246,6 +246,10 @@ class Bot:
             self._tasks.append(
                 asyncio.create_task(self._tracker.run(), name="trader-tracker")
             )
+            # Wire ClobFeed → Tracker: last_trade_price events on watched tokens
+            # interrupt the tracker's poll sleep for near-immediate Data API checks.
+            if self._clob_feed:
+                self._clob_feed.set_trade_activity_callback(self._tracker.signal_activity)
 
         # 7. Start interactive console (stdin command reader)
         self._tasks.append(

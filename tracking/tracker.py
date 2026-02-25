@@ -76,6 +76,11 @@ class TrackedTrade:
         for sym in config.TARGET_SYMBOLS:
             if sym in q:
                 return sym
+        # Polymarket titles use full names ("Bitcoin Up or Down") not tickers
+        _FULL_NAMES = {"BITCOIN": "BTC", "ETHEREUM": "ETH", "SOLANA": "SOL", "RIPPLE": "XRP"}
+        for name, sym in _FULL_NAMES.items():
+            if name in q:
+                return sym
         return None
 
     @property
@@ -143,6 +148,13 @@ class TraderTracker:
         # Stats
         self._total_seen:  int = 0
         self._started_at:  float = 0.0
+        # Reactive polling: set by signal_activity() when WS detects market activity.
+        # Interrupts the poll sleep so we hit the Data API without waiting the full interval.
+        self._activity_event: asyncio.Event = asyncio.Event()
+        # Minimum gap (seconds) between activity-triggered polls to avoid Data API spam.
+        _REACTIVE_MIN_INTERVAL = 3.0
+        self._REACTIVE_MIN_INTERVAL = _REACTIVE_MIN_INTERVAL
+        self._last_poll_time: float = 0.0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -187,7 +199,23 @@ class TraderTracker:
 
             _wallet_refresh_countdown = 0
             while True:
-                await asyncio.sleep(config.TRACKER_POLL_SECS)
+                # Wait for either: normal poll interval or a WS activity signal.
+                # whichever comes first wakes us; the event is cleared after.
+                try:
+                    await asyncio.wait_for(
+                        self._activity_event.wait(),
+                        timeout=config.TRACKER_POLL_SECS,
+                    )
+                    self._activity_event.clear()
+                    # Debounce: don't react faster than REACTIVE_MIN_INTERVAL
+                    now = time.monotonic()
+                    if now - self._last_poll_time < self._REACTIVE_MIN_INTERVAL:
+                        continue
+                    log.debug("Tracker: WS activity signal — polling immediately")
+                except asyncio.TimeoutError:
+                    pass  # normal poll interval expired
+
+                self._last_poll_time = time.monotonic()
                 try:
                     await self._poll()
                 except asyncio.CancelledError:
@@ -200,6 +228,14 @@ class TraderTracker:
                 if _wallet_refresh_countdown >= max(1, int(300 / config.TRACKER_POLL_SECS)):
                     _wallet_refresh_countdown = 0
                     await self.refresh_wallet_value()
+
+    def signal_activity(self, token_id: str) -> None:
+        """
+        Called by the ClobFeed when a last_trade_price event fires on a watched
+        token — meaning SOMEONE just traded that market.  Sets the activity event
+        so the poll loop wakes up immediately instead of waiting for the next timer.
+        """
+        self._activity_event.set()
 
     # ------------------------------------------------------------------
     # Polling
