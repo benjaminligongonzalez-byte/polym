@@ -99,9 +99,16 @@ log = logging.getLogger("bot")
 # ---------------------------------------------------------------------------
 
 class Bot:
-    def __init__(self, use_momentum: bool = True, use_arb: bool = True) -> None:
+    def __init__(
+        self,
+        use_momentum: bool = True,
+        use_arb: bool = True,
+        copy_mode: str = "",
+    ) -> None:
         self._use_momentum = use_momentum
         self._use_arb = use_arb
+        # "blind" | "gated" | "" (off).  Can be toggled live via console.
+        self._copy_mode: str = copy_mode or config.TRACKER_COPY_MODE if config.TRACKER_COPY_TRADE else ""
 
         self._pm_client = PolymarketClient()
         self._market_cache = MarketCache()
@@ -223,12 +230,18 @@ class Bot:
                 asyncio.create_task(self._clob_refresh_loop(), name="clob-refresh")
             )
 
-        # Optional: live trade tracker for a target Polymarket wallet
+        # Optional: live trade tracker for a target Polymarket wallet.
+        # Always wire the callback — _on_tracked_trade routes to blind/gated/off.
         if config.TRACK_ADDRESS:
-            copy_cb = self._on_tracked_trade if config.TRACKER_COPY_TRADE else None
+            _mode_label = {
+                "blind": "BLIND (no gates — proportional sizing)",
+                "gated": "GATED (fair-value + TA gates)",
+                "":      "WATCH ONLY (no orders)",
+            }.get(self._copy_mode, self._copy_mode)
+            log.info("Tracker: %s  copy-mode=%s", config.TRACK_ADDRESS[:16] + "…", _mode_label)
             self._tracker = TraderTracker(
                 address=config.TRACK_ADDRESS,
-                on_trade=copy_cb,
+                on_trade=self._on_tracked_trade,
             )
             self._tasks.append(
                 asyncio.create_task(self._tracker.run(), name="trader-tracker")
@@ -301,28 +314,47 @@ class Bot:
 
     async def _on_tracked_trade(self, trade: "TraderTracker") -> None:  # type: ignore[name-defined]
         """
-        Fired by TraderTracker when the target address places a new BUY.
+        Fired by TraderTracker when the target address places a new trade.
 
-        Routes through the bot's normal momentum signal path so every gate
-        (fair-value, TA, risk, cooldown) still applies — we never blindly copy.
+        Routing depends on self._copy_mode (settable via CLI or live console):
+          "blind"  — execute_blind_copy: no gates, proportional sizing
+          "gated"  — execute_signal: full fair-value / TA / risk gates
+          ""       — tracker is watch-only; no orders placed
         """
         from tracking.tracker import TrackedTrade
         if not isinstance(trade, TrackedTrade):
             return
         if trade.side != "BUY":
-            return  # don't copy sells
+            return  # only copy buys
+
+        mode = self._copy_mode
+        if not mode:
+            return  # watch-only
+
         om = self._order_manager
-        if om is None or om.is_paused():
+        if om is None:
             return
-        sym       = trade.symbol
-        direction = trade.direction
-        if sym is None or direction is None:
-            return  # not a market we trade
-        log.info(
-            "COPY-TRADE signal: %s %s @ %.2f¢ — routing through execute_signal",
-            sym, direction, trade.price * 100,
-        )
-        await om.execute_signal(sym, direction, price_move_pct=0.0)
+
+        if mode == "blind":
+            target_val = self._tracker.target_wallet_value if self._tracker else None
+            await om.execute_blind_copy(trade, target_val)
+
+        else:  # "gated"
+            if om.is_paused():
+                return
+            sym       = trade.symbol
+            direction = trade.direction
+            if sym is None or direction is None:
+                log.debug(
+                    "COPY-TRADE (gated): %s is not a mapped market — skip",
+                    trade.question[:50],
+                )
+                return
+            log.info(
+                "COPY-TRADE (gated): %s %s @ %.2f¢ — routing through execute_signal",
+                sym, direction, trade.price * 100,
+            )
+            await om.execute_signal(sym, direction, price_move_pct=0.0)
 
     # ------------------------------------------------------------------
     # Interactive console
@@ -335,6 +367,9 @@ Commands (type and press Enter):
   m  /  markets    — active markets in cache with time remaining
   t  /  trades     — full session trade log (copy-paste for analysis)
   w  /  watch      — copy-watch tracker: target address positions + recent trades
+  copy-blind       — switch to blind copy mode (no gates, proportional sizing)
+  copy-gated       — switch to gated copy mode (fair-value + TA gates apply)
+  copy-off         — disable copy-trading (tracker watches only, no orders)
   pause            — stop new orders; let existing positions settle naturally
   resume           — resume trading after a pause (also cancels drain)
   drain            — pause + auto-shutdown once all open positions close
@@ -440,6 +475,30 @@ Commands (type and press Enter):
                 else:
                     print("  Tracker starting up…", flush=True)
 
+            elif cmd == "copy-blind":
+                if not config.TRACK_ADDRESS:
+                    print("  Tracker not configured — set TRACK_ADDRESS in .env", flush=True)
+                else:
+                    self._copy_mode = "blind"
+                    print(
+                        "  Copy mode → BLIND  (every BUY mirrored, proportional sizing, no gates)",
+                        flush=True,
+                    )
+
+            elif cmd == "copy-gated":
+                if not config.TRACK_ADDRESS:
+                    print("  Tracker not configured — set TRACK_ADDRESS in .env", flush=True)
+                else:
+                    self._copy_mode = "gated"
+                    print(
+                        "  Copy mode → GATED  (signals routed through fair-value + TA gates)",
+                        flush=True,
+                    )
+
+            elif cmd == "copy-off":
+                self._copy_mode = ""
+                print("  Copy mode → OFF  (tracker watches only — no orders placed)", flush=True)
+
             elif cmd == "pause":
                 if om:
                     om.pause()
@@ -537,9 +596,18 @@ async def main(args: argparse.Namespace) -> None:
 
     _setup_logging(args.loglevel)
 
+    # CLI flags override TRACKER_COPY_MODE from .env
+    if args.copy_blind:
+        copy_mode = "blind"
+    elif args.copy_gated:
+        copy_mode = "gated"
+    else:
+        copy_mode = ""  # let Bot.__init__ fall back to config
+
     bot = Bot(
         use_momentum=not args.no_momentum,
         use_arb=not args.no_arb,
+        copy_mode=copy_mode,
     )
 
     loop = asyncio.get_running_loop()
@@ -590,6 +658,25 @@ if __name__ == "__main__":
         default=config.LOG_LEVEL,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO)",
+    )
+    copy_group = parser.add_mutually_exclusive_group()
+    copy_group.add_argument(
+        "--copy-blind",
+        action="store_true",
+        default=False,
+        help=(
+            "Mirror every BUY from TRACK_ADDRESS without gates. "
+            "Order size is proportional to target wallet usage."
+        ),
+    )
+    copy_group.add_argument(
+        "--copy-gated",
+        action="store_true",
+        default=False,
+        help=(
+            "Copy signals from TRACK_ADDRESS but route through fair-value, "
+            "TA, and risk gates before placing orders."
+        ),
     )
     parsed = parser.parse_args()
 

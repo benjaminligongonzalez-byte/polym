@@ -126,6 +126,10 @@ class TraderTracker:
         # token_id → question (for display in status_report)
         self._token_questions: dict[str, str] = {}
 
+        # Target wallet value (USDC) — fetched periodically for proportional sizing
+        self._target_wallet_value: float | None = None
+        self._wallet_value_ts: float = 0.0  # monotonic time of last fetch
+
         # Stats
         self._total_seen:  int = 0
         self._started_at:  float = 0.0
@@ -163,6 +167,10 @@ class TraderTracker:
                 _MAGENTA, _RESET, len(self._seen_ids),
             )
 
+            # Fetch target wallet value for proportional copy sizing
+            await self.refresh_wallet_value()
+
+            _wallet_refresh_countdown = 0
             while True:
                 await asyncio.sleep(config.TRACKER_POLL_SECS)
                 try:
@@ -171,6 +179,12 @@ class TraderTracker:
                     raise
                 except Exception as exc:
                     log.debug("TraderTracker poll error: %s", exc)
+
+                # Refresh target wallet value every ~5 minutes
+                _wallet_refresh_countdown += 1
+                if _wallet_refresh_countdown >= max(1, int(300 / config.TRACKER_POLL_SECS)):
+                    _wallet_refresh_countdown = 0
+                    await self.refresh_wallet_value()
 
     # ------------------------------------------------------------------
     # Polling
@@ -469,6 +483,76 @@ class TraderTracker:
             self._net_shares[key] = new_val
             if trade.question:
                 self._token_questions[key] = trade.question
+
+    # ------------------------------------------------------------------
+    # Target wallet value (for proportional copy-trade sizing)
+    # ------------------------------------------------------------------
+
+    @property
+    def target_wallet_value(self) -> float | None:
+        """Last known USDC value of the target's Polymarket portfolio."""
+        return self._target_wallet_value
+
+    async def refresh_wallet_value(self) -> float | None:
+        """
+        Query the Polymarket Data API for the target address's portfolio value.
+
+        Tries several known endpoints in order; returns the value in USDC or
+        None if unavailable.  Result is cached internally and exposed via the
+        target_wallet_value property.
+        """
+        if self._session is None:
+            return self._target_wallet_value
+
+        val: float | None = None
+
+        # Attempt 1: /value endpoint (returns {"value": N} or {"portfolio": N})
+        try:
+            url = f"{config.DATA_API}/value"
+            async with self._session.get(url, params={"user": self._address}) as resp:
+                if resp.status == 200:
+                    body = await resp.json(content_type=None)
+                    for key in ("value", "portfolio", "usdcBalance", "portfolioValue", "balance"):
+                        if isinstance(body, dict) and key in body:
+                            val = float(body[key])
+                            break
+        except Exception as exc:
+            log.debug("Tracker: wallet value /value fetch failed: %s", exc)
+
+        # Attempt 2: sum open positions currentValue if /value didn't work
+        if val is None:
+            try:
+                url = f"{config.DATA_API}/positions"
+                params = {"user": self._address, "sizeThreshold": "0", "limit": "500"}
+                async with self._session.get(url, params=params) as resp:
+                    if resp.status == 200:
+                        body = await resp.json(content_type=None)
+                        positions = body if isinstance(body, list) else body.get("data", [])
+                        total = 0.0
+                        for pos in positions:
+                            for key in ("currentValue", "value", "usdcValue"):
+                                if key in pos:
+                                    total += float(pos[key])
+                                    break
+                        if total > 0:
+                            val = total
+            except Exception as exc:
+                log.debug("Tracker: wallet value /positions sum failed: %s", exc)
+
+        if val is not None and val > 0:
+            prev = self._target_wallet_value
+            self._target_wallet_value = val
+            self._wallet_value_ts = time.monotonic()
+            if prev is None or abs(val - prev) > 1.0:
+                log.info(
+                    "👁 TRACKER  target wallet value: $%.2f USDC%s",
+                    val,
+                    f"  (was ${prev:.2f})" if prev is not None else "",
+                )
+        else:
+            log.debug("Tracker: could not determine target wallet value — will use fallback sizing")
+
+        return self._target_wallet_value
 
     # ------------------------------------------------------------------
     # Status report (for 'w' console command)

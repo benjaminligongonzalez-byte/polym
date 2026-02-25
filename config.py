@@ -311,10 +311,21 @@ TRACK_ADDRESS: str = os.environ.get("TRACK_ADDRESS", "")
 # Lower = faster alerts; Polymarket APIs can handle ~4 req/s comfortably.
 TRACKER_POLL_SECS: float = float(os.environ.get("TRACKER_POLL_SECS", "10"))
 
-# Set to "true" to automatically copy-trade any market-mapped BUY the
-# target places, routed through the bot's normal gates (fair-value, TA,
-# risk management).  We never blindly copy — all our filters still apply.
+# Copy-trade mode.  Can be overridden at startup with --copy-blind /
+# --copy-gated flags, or toggled live from the interactive console.
+#
+#   "blind"  — mirror every BUY from the target wallet without running
+#              through fair-value, TA, or edge gates.  Order size is
+#              proportional (same % of our wallet they used of theirs).
+#   "gated"  — route copy signals through the bot's normal momentum
+#              gates (fair-value, TA, risk management) before placing.
+#   ""       — copy-trade disabled; tracker watches only (no orders).
 TRACKER_COPY_TRADE: bool = os.environ.get("TRACKER_COPY_TRADE", "false").lower() == "true"
+TRACKER_COPY_MODE: str = os.environ.get("TRACKER_COPY_MODE", "gated").lower()  # "blind" | "gated"
+
+# Fallback USDC per blind-copy order when the target's wallet value
+# cannot be determined (proportional sizing unavailable).
+COPY_BLIND_USDC: float = float(os.environ.get("COPY_BLIND_USDC", "10"))
 
 # ---------------------------------------------------------------------------
 # Logging

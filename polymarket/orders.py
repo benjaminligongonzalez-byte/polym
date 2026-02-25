@@ -508,6 +508,94 @@ class OrderManager:
         )
 
     # ------------------------------------------------------------------
+    # Blind copy-trade handler
+    # ------------------------------------------------------------------
+
+    async def execute_blind_copy(
+        self,
+        trade: "TrackedTrade",  # type: ignore[name-defined]
+        target_wallet_value: float | None,
+    ) -> None:
+        """
+        Copy a trade from the tracked wallet WITHOUT running through any
+        strategy gates (no fair-value, no TA, no edge requirement).
+
+        Order sizing is proportional: we put the same fraction of our wallet
+        that the target used of theirs.  Falls back to COPY_BLIND_USDC if
+        the target's wallet value is unknown.
+
+        Only hard guards applied:
+          - bot must not be paused
+          - we must have sufficient balance
+          - order size is clamped to [min_order_usdc, max_order_usdc_hard]
+        """
+        from tracking.tracker import TrackedTrade  # local import
+
+        if not isinstance(trade, TrackedTrade):
+            return
+        if self._paused:
+            log.debug("Blind copy skipped — bot is paused.")
+            return
+
+        # ── Proportional sizing ────────────────────────────────────────
+        if target_wallet_value and target_wallet_value > 0 and trade.amount > 0:
+            fraction  = trade.amount / target_wallet_value
+            order_usdc = fraction * self._wallet_balance
+            log.debug(
+                "Blind copy sizing: target used %.2f / %.2f = %.2f%% → our order $%.2f",
+                trade.amount, target_wallet_value, fraction * 100, order_usdc,
+            )
+        else:
+            order_usdc = config.COPY_BLIND_USDC
+            log.debug(
+                "Blind copy sizing: no target wallet value — using fallback $%.2f",
+                order_usdc,
+            )
+
+        order_usdc = max(
+            config.RISK.min_order_usdc,
+            min(order_usdc, config.RISK.max_order_usdc_hard),
+        )
+
+        # ── Balance check ──────────────────────────────────────────────
+        min_reserve = getattr(config.RISK, "min_wallet_balance", 0.0)
+        if self._wallet_balance - order_usdc < min_reserve:
+            log.warning(
+                "Blind copy: insufficient balance $%.2f for $%.2f order (reserve $%.2f) — skip",
+                self._wallet_balance, order_usdc, min_reserve,
+            )
+            return
+
+        # ── Place order ────────────────────────────────────────────────
+        limit_price = round(min(trade.price + config.RISK.slippage_tolerance, 0.99), 4)
+        shares      = round(order_usdc / limit_price, 2)
+
+        outcome_col = _GREEN if trade.outcome in ("Up", "Yes") else _RED
+        log.info(
+            "%s[BLIND-COPY]%s  %s%s%s  %s  @ %.4f  "
+            "(%.2f shares / $%.2f USDC)  %swallet=$%.2f%s",
+            _MAGENTA, _RESET,
+            outcome_col, trade.outcome, _RESET,
+            trade.question[:50],
+            limit_price, shares, order_usdc,
+            _BOLD, self._wallet_balance, _RESET,
+        )
+
+        resp = await self._client.create_limit_order(
+            token_id=trade.token_id,
+            side="BUY",
+            price=limit_price,
+            size=shares,
+        )
+
+        if resp is not None:
+            self._orders_placed += 1
+            log.info(
+                "%s[BLIND-COPY]%s  order placed — %s token=%s…",
+                _MAGENTA, _RESET, trade.question[:40], trade.token_id[:12],
+            )
+
+    # ------------------------------------------------------------------
     # Early exit scan
     # ------------------------------------------------------------------
 
