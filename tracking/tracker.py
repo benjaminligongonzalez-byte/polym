@@ -99,16 +99,11 @@ class TrackedTrade:
 class LoggedTrade:
     """Enriched record of a single observed trade, stored for strategy analysis."""
     trade:       TrackedTrade
-    detected_at: float         # unix epoch: when our bot first saw this trade
     seq:         int           # trade number within this session (1-based)
     pos_before:  float         # net shares in this token BEFORE this trade
     pos_after:   float         # net shares AFTER this trade
     trade_type:  str           # OPEN / ADD / TRIM / CLOSE / FLIP / SHORT / ADD_S / COVER
-    spot_price:  float | None  # consensus crypto spot price at detection time (USD)
-
-    @property
-    def lag(self) -> float:
-        return self.detected_at - self.trade.timestamp
+    spot_price:  float | None  # consensus crypto spot price at time of trade (USD)
 
     @property
     def price_cents(self) -> float:
@@ -595,13 +590,12 @@ class TraderTracker:
         spot        = self._price_feed(trade.symbol) if self._price_feed and trade.symbol else None
         self._session_seq += 1
         self._logged_trades.append(LoggedTrade(
-            trade       = trade,
-            detected_at = time.time(),
-            seq         = self._session_seq,
-            pos_before  = pos_before,
-            pos_after   = pos_after,
-            trade_type  = LoggedTrade._infer_type(trade.side, pos_before, pos_after),
-            spot_price  = spot,
+            trade      = trade,
+            seq        = self._session_seq,
+            pos_before = pos_before,
+            pos_after  = pos_after,
+            trade_type = LoggedTrade._infer_type(trade.side, pos_before, pos_after),
+            spot_price = spot,
         ))
         # ─────────────────────────────────────────────────────────────────────
         side_col = _GREEN if trade.side == "BUY" else _RED
@@ -867,7 +861,7 @@ class TraderTracker:
             lines.append("  (no trades yet)")
         else:
             hdr = (
-                f"  {'#':>4}  {'TIME':8}  {'LAG':>5}  {'TYPE':5}  {'SIDE':4}  "
+                f"  {'#':>4}  {'TIME':8}  {'TYPE':5}  {'SIDE':4}  "
                 f"{'DIR':4}  {'BET':>6}  {'SHARES':>7}  {'USD':>7}  "
                 f"{'BEFORE':>7}  {'AFTER':>7}  {'SPOT':>10}  MARKET"
             )
@@ -876,13 +870,12 @@ class TraderTracker:
             for lt in self._logged_trades:
                 t      = lt.trade
                 ts_str = datetime.datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
-                lag_s  = int(lt.lag)
                 side_s = "BUY " if t.side == "BUY" else "SELL"
                 dir_s  = (t.direction or "?").ljust(4)
                 mkt    = self._shorten_market(t.question, 30)
                 spot_s = f"${lt.spot_price:,.2f}" if lt.spot_price else "     n/a"
                 lines.append(
-                    f"  {lt.seq:>4}  {ts_str}  {lag_s:>4}s  {lt.trade_type:<5}  {side_s}  "
+                    f"  {lt.seq:>4}  {ts_str}  {lt.trade_type:<5}  {side_s}  "
                     f"{dir_s}  {lt.price_cents:>5.1f}¢  {t.size:>7.1f}  ${t.amount:>6.2f}  "
                     f"{lt.pos_before:>+7.1f}  {lt.pos_after:>+7.1f}  {spot_s:>10}  {mkt}"
                 )
@@ -900,8 +893,6 @@ class TraderTracker:
             buy_p  = [lt.price_cents for lt in buys]
             sell_p = [lt.price_cents for lt in sells]
             all_u  = [lt.trade.amount for lt in self._logged_trades]
-
-            lags   = [lt.lag for lt in self._logged_trades]
 
             lines += ["", SEP, "  SUMMARY", "  " + sep]
             lines.append(
@@ -922,11 +913,6 @@ class TraderTracker:
                 lines.append(
                     f"  Trade $ size: min ${min(all_u):.2f}  max ${max(all_u):.2f}  "
                     f"avg ${sum(all_u)/len(all_u):.2f}"
-                )
-            if lags:
-                lines.append(
-                    f"  Detection lag: min {min(lags):.0f}s  max {max(lags):.0f}s  "
-                    f"avg {sum(lags)/len(lags):.0f}s"
                 )
 
             # ── Per-token breakdown ───────────────────────────────────────────
