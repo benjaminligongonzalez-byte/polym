@@ -140,8 +140,10 @@ class OrderManager:
         self._positions: dict[str, OpenPosition] = {}
         # Trade history
         self._closed_trades: list[ClosedTrade] = []
-        self._orders_placed: int = 0      # total orders sent (momentum + arb)
-        self._blind_copy_count: int = 0   # blind copy orders placed
+        self._orders_placed: int = 0        # total orders sent (momentum + arb)
+        self._blind_copy_count: int = 0     # blind copy orders placed
+        self._blind_positions: list[OpenPosition] = []  # tracked separately from _positions
+                                            # so check_exits doesn't prematurely resolve them
         self._session_start: float = time.monotonic()
         # Paper-trade running P&L (applied to wallet balance so sizing stays accurate)
         self._paper_pnl: float = 0.0
@@ -276,7 +278,10 @@ class OrderManager:
 
     @property
     def total_exposure(self) -> float:
-        return sum(p.cost_usdc for p in self._positions.values())
+        return (
+            sum(p.cost_usdc for p in self._positions.values())
+            + sum(p.cost_usdc for p in self._blind_positions)
+        )
 
     def _on_cooldown(self, condition_id: str) -> bool:
         last = self._last_trade.get(condition_id, 0.0)
@@ -601,6 +606,21 @@ class OrderManager:
 
         if resp is not None:
             self._blind_copy_count += 1
+            self._blind_positions.append(OpenPosition(
+                condition_id=trade.condition_id,
+                token_id=trade.token_id,
+                bet=trade.outcome or "?",
+                entry_price=limit_price,
+                entry_mid=trade.price,
+                shares=shares,
+                cost_usdc=order_usdc,
+                question=trade.question,
+                symbol=trade.symbol or "?",
+                strike_price=0.0,
+                is_snipe=False,
+                entered_at=time.monotonic(),
+                source="BLIND-COPY",
+            ))
             log.info(
                 "%s[BLIND-COPY]%s  order placed — %s%s%s  token=%s  cid=%s",
                 _MAGENTA, _RESET,
@@ -992,7 +1012,8 @@ class OrderManager:
             f"{'─' * 60}",
             f"  Orders placed   : {_CYAN}{self._orders_placed}{_RESET}"
             + (f"  {_MAGENTA}(+ {self._blind_copy_count} blind copies){_RESET}" if self._blind_copy_count else ""),
-            f"  Open positions  : {_CYAN}{len(self._positions)}{_RESET}",
+            f"  Open positions  : {_CYAN}{len(self._positions)}{_RESET}"
+            + (f"  {_MAGENTA}(+ {len(self._blind_positions)} blind){_RESET}" if self._blind_positions else ""),
             f"  Closed trades   : {len(self._closed_trades)}",
             f"    ├ Early exits : {len(priced)}  ({_GREEN}wins={len(wins)}{_RESET}  {_RED}losses={len(losses)}{_RESET})",
             f"    └ Resolved    : {len(resolved)}  (P&L pending market resolution)",
@@ -1022,48 +1043,75 @@ class OrderManager:
 
     def positions_report(self) -> str:
         """Return details of all currently open positions."""
-        if not self._positions:
+        if not self._positions and not self._blind_positions:
             return "  No open positions currently open."
 
         now = time.monotonic()
-        total_cost = sum(p.cost_usdc for p in self._positions.values())
-        lines = [
-            f"{_BOLD}{'═' * 60}{_RESET}",
-            f"  {_BOLD}OPEN POSITIONS{_RESET}  ({_CYAN}{len(self._positions)} bets{_RESET}  /  ${total_cost:.2f} at risk)",
-            f"{_BOLD}{'═' * 60}{_RESET}",
-        ]
-        for i, pos in enumerate(self._positions.values(), 1):
-            age_s = int(now - pos.entered_at)
-            age_m, age_s2 = divmod(age_s, 60)
-            market = self._cache.get_market(pos.condition_id)
-            t_rem = market.time_remaining_secs if market else None
-            if t_rem is not None and t_rem > 0:
-                tr_m, tr_s = divmod(int(t_rem), 60)
-                t_rem_str = f"{tr_m}m{tr_s:02d}s left"
-                # Colour by urgency: yellow <3min, red <1min
-                t_col = _RED if t_rem < 60 else (_YELLOW if t_rem < 180 else _GREEN)
-                t_rem_str = f"{t_col}{t_rem_str}{_RESET}"
-            elif t_rem is not None:
-                t_rem_str = f"{_RED}EXPIRED{_RESET}"
-            else:
-                t_rem_str = f"{_DIM}t_rem unknown{_RESET}"
+        lines = [f"{_BOLD}{'═' * 60}{_RESET}"]
 
-            dir_col = _GREEN if pos.bet == "Up" else _RED
-            src_col = _YELLOW if pos.source == "SNIPE" else _CYAN if pos.source == "ARB" else _DIM
+        # ── Own-strategy positions ────────────────────────────────────
+        if self._positions:
+            total_cost = sum(p.cost_usdc for p in self._positions.values())
             lines.append(
-                f"  [{i}] {_BOLD}{_CYAN}{pos.symbol}{_RESET} "
-                f"{dir_col}{pos.bet.upper():<4}{_RESET}  "
-                f"{src_col}{pos.source:<9}{_RESET}  "
-                f"entry={_BOLD}${pos.entry_price:.4f}{_RESET}  "
-                f"shares={pos.shares:.2f}  cost=${pos.cost_usdc:.2f}"
+                f"  {_BOLD}OWN POSITIONS{_RESET}  "
+                f"({_CYAN}{len(self._positions)} bets{_RESET}  /  ${total_cost:.2f} at risk)"
             )
+            lines.append(f"{'─' * 60}")
+            for i, pos in enumerate(self._positions.values(), 1):
+                age_s = int(now - pos.entered_at)
+                age_m, age_s2 = divmod(age_s, 60)
+                market = self._cache.get_market(pos.condition_id)
+                t_rem = market.time_remaining_secs if market else None
+                if t_rem is not None and t_rem > 0:
+                    tr_m, tr_s = divmod(int(t_rem), 60)
+                    t_col = _RED if t_rem < 60 else (_YELLOW if t_rem < 180 else _GREEN)
+                    t_rem_str = f"{t_col}{tr_m}m{tr_s:02d}s left{_RESET}"
+                elif t_rem is not None:
+                    t_rem_str = f"{_RED}EXPIRED{_RESET}"
+                else:
+                    t_rem_str = f"{_DIM}t_rem unknown{_RESET}"
+
+                dir_col = _GREEN if pos.bet == "Up" else _RED
+                src_col = _YELLOW if pos.source == "SNIPE" else _CYAN if pos.source == "ARB" else _DIM
+                lines.append(
+                    f"  [{i}] {_BOLD}{_CYAN}{pos.symbol}{_RESET} "
+                    f"{dir_col}{pos.bet.upper():<4}{_RESET}  "
+                    f"{src_col}{pos.source:<9}{_RESET}  "
+                    f"entry={_BOLD}${pos.entry_price:.4f}{_RESET}  "
+                    f"shares={pos.shares:.2f}  cost=${pos.cost_usdc:.2f}"
+                )
+                lines.append(
+                    f"       age={age_m}m{age_s2:02d}s  {t_rem_str}  "
+                    f"{_DIM}cid={pos.condition_id[:10]}…{_RESET}"
+                )
+                lines.append(f"       {_DIM}{pos.question}{_RESET}")
+                if i < len(self._positions):
+                    lines.append(f"  {'·' * 56}")
+
+        # ── Blind copy positions ──────────────────────────────────────
+        if self._blind_positions:
+            blind_cost = sum(p.cost_usdc for p in self._blind_positions)
+            if self._positions:
+                lines.append(f"{'─' * 60}")
             lines.append(
-                f"       age={age_m}m{age_s2:02d}s  {t_rem_str}  "
-                f"{_DIM}cid={pos.condition_id[:10]}…{_RESET}"
+                f"  {_BOLD}{_MAGENTA}BLIND COPIES{_RESET}  "
+                f"({_MAGENTA}{len(self._blind_positions)} bets{_RESET}  /  ${blind_cost:.2f} at risk)"
             )
-            lines.append(f"       {_DIM}{pos.question}{_RESET}")
-            if i < len(self._positions):
-                lines.append(f"  {'·' * 56}")
+            lines.append(f"{'─' * 60}")
+            for i, pos in enumerate(self._blind_positions, 1):
+                age_s = int(now - pos.entered_at)
+                age_m, age_s2 = divmod(age_s, 60)
+                dir_col = _GREEN if pos.bet in ("Up", "Yes") else _RED
+                lines.append(
+                    f"  [{i}] {_MAGENTA}COPY{_RESET}  "
+                    f"{dir_col}{pos.bet.upper():<4}{_RESET}  "
+                    f"entry={_BOLD}${pos.entry_price:.4f}{_RESET}  "
+                    f"shares={pos.shares:.2f}  cost=${pos.cost_usdc:.2f}"
+                )
+                lines.append(f"       age={age_m}m{age_s2:02d}s  {_DIM}cid={pos.condition_id[:10]}…{_RESET}")
+                lines.append(f"       {_DIM}{pos.question[:65]}{_RESET}")
+                if i < len(self._blind_positions):
+                    lines.append(f"  {'·' * 56}")
 
         lines.append(f"{_BOLD}{'═' * 60}{_RESET}")
         return "\n".join(lines)
