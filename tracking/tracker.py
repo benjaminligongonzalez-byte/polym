@@ -536,7 +536,7 @@ class TraderTracker:
         try:
             assert self._session is not None
             url    = f"{config.GAMMA_API}/markets"
-            params = {"id": condition_id}
+            params = {"conditionId": condition_id}
             async with self._session.get(url, params=params) as resp:
                 if resp.status == 200:
                     body    = await resp.json(content_type=None)
