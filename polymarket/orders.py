@@ -631,6 +631,83 @@ class OrderManager:
             )
 
     # ------------------------------------------------------------------
+    # Blind copy sell mirror
+    # ------------------------------------------------------------------
+
+    async def execute_blind_sell(
+        self,
+        trade: "TrackedTrade",  # type: ignore[name-defined]
+    ) -> None:
+        """
+        Mirror a SELL from the target wallet: close every blind copy position
+        we hold in the same token.
+
+        We sell ALL matching positions when the target sells any amount —
+        the simplest safe behaviour for a scalper who exits fully before
+        re-entering.
+        """
+        if self._paused:
+            return
+
+        token_id = trade.token_id
+        if not token_id:
+            log.debug("Blind sell: no token_id on SELL trade — skip")
+            return
+
+        matching = [p for p in self._blind_positions if p.token_id == token_id]
+        if not matching:
+            # Target sold a position we never copied (e.g. pre-session entry)
+            log.debug(
+                "Blind sell: no matching position for token %s — target sold pre-session hold",
+                token_id[:16],
+            )
+            return
+
+        # Get current mid — use cache first, fetch fresh if missing
+        mid = self._mid_cache.get(token_id)
+        if mid is None:
+            try:
+                mid = await self._client.get_midpoint(token_id)
+                self._mid_cache[token_id] = mid
+            except Exception as exc:
+                log.warning("Blind sell: midpoint fetch failed for %s: %s", token_id[:16], exc)
+                return
+
+        sell_price = round(max(mid - config.RISK.slippage_tolerance, 0.01), 4)
+
+        for pos in matching:
+            pnl = round((sell_price - pos.entry_price) * pos.shares, 4)
+            pnl_col  = _GREEN if pnl >= 0 else _RED
+            pnl_sign = "+" if pnl >= 0 else ""
+            log.info(
+                "%s[BLIND-SELL]%s  %s%s%s  %s  entry=%.4f → %.4f  "
+                "%s%s$%s%.4f%s  (%.2f shares)",
+                _MAGENTA, _RESET,
+                _GREEN if pos.bet in ("Up", "Yes") else _RED, pos.bet, _RESET,
+                pos.question[:45],
+                pos.entry_price, sell_price,
+                pnl_col, _BOLD, pnl_sign, pnl, _RESET,
+                pos.shares,
+            )
+            resp = await self._client.create_limit_order(
+                token_id=pos.token_id,
+                side="SELL",
+                price=sell_price,
+                size=pos.shares,
+            )
+            if resp is not None:
+                self._blind_positions.remove(pos)
+
+        remaining = len([p for p in self._blind_positions if p.token_id == token_id])
+        sold = len(matching) - remaining
+        log.info(
+            "%s[BLIND-SELL]%s  closed %d position(s) for token %s…  "
+            "(%d remaining in other markets)",
+            _MAGENTA, _RESET, sold, token_id[:16],
+            len(self._blind_positions),
+        )
+
+    # ------------------------------------------------------------------
     # Early exit scan
     # ------------------------------------------------------------------
 

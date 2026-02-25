@@ -324,8 +324,6 @@ class Bot:
         from tracking.tracker import TrackedTrade
         if not isinstance(trade, TrackedTrade):
             return
-        if trade.side != "BUY":
-            return  # only copy buys
 
         mode = self._copy_mode
         if not mode:
@@ -336,6 +334,9 @@ class Bot:
             return
 
         if mode == "blind":
+            if trade.side == "SELL":
+                await om.execute_blind_sell(trade)
+                return
             target_val = self._tracker.target_wallet_value if self._tracker else None
             await om.execute_blind_copy(trade, target_val)
 
