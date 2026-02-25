@@ -218,23 +218,29 @@ class TraderTracker:
                 log.debug("TraderTracker: failed to process %s: %s", tid[:12], exc)
 
     # ------------------------------------------------------------------
-    # API calls  (Data API primary, CLOB API fallback)
+    # API calls  (CLOB primary — lowest latency; Data API fallback)
     # ------------------------------------------------------------------
 
     async def _fetch_all(self) -> list[dict]:
-        """Fetch recent trades; try Data API first, CLOB as fallback."""
+        """
+        Fetch recent trades; try CLOB API first (lowest indexing latency —
+        trades appear here the moment they match), Data API as fallback.
+        """
+        try:
+            result = await self._fetch_clob_api()
+            if result:
+                return result
+        except Exception as exc:
+            log.debug("Tracker: CLOB API error (%s) — trying Data API", exc)
+
         try:
             result = await self._fetch_data_api()
             if result is not None:
                 return result
         except Exception as exc:
-            log.debug("Tracker: Data API error (%s) — trying CLOB API", exc)
+            log.debug("Tracker: Data API also failed: %s", exc)
 
-        try:
-            return await self._fetch_clob_api()
-        except Exception as exc:
-            log.debug("Tracker: CLOB API also failed: %s", exc)
-            return []
+        return []
 
     async def _fetch_data_api(self) -> list[dict] | None:
         """
@@ -453,15 +459,21 @@ class TraderTracker:
 
         ts_str = datetime.datetime.fromtimestamp(trade.timestamp).strftime("%H:%M:%S")
 
+        # Detection lag: how old was the trade when we first saw it
+        lag_secs = time.time() - trade.timestamp
+        lag_col  = _RED if lag_secs > 5 else _YELLOW if lag_secs > 2 else _GREEN
+        lag_tag  = f"  {lag_col}+{lag_secs:.1f}s lag{_RESET}"
+
         log.info(
             "%s👁 COPY-WATCH%s  %s  %s%s %s%s  "
-            "@ %s%.2f¢%s  %.1f shares / %s$%.2f%s  |  %s",
+            "@ %s%.2f¢%s  %.1f shares / %s$%.2f%s%s  |  %s",
             _MAGENTA, _RESET,
             side_tag,
             ts_str, _DIM, "", _RESET,
             _BOLD, trade.price * 100, _RESET,
             trade.size,
             _BOLD, trade.amount, _RESET,
+            lag_tag,
             trade.question[:65],
         )
 

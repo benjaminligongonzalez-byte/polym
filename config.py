@@ -307,9 +307,10 @@ RISK = RiskConfig()
 # on the command line.  Leave blank to disable the tracker entirely.
 TRACK_ADDRESS: str = os.environ.get("TRACK_ADDRESS", "")
 
-# How often (seconds) to poll the Data API / CLOB API for new trades.
-# Lower = faster alerts; Polymarket APIs can handle ~4 req/s comfortably.
-TRACKER_POLL_SECS: float = float(os.environ.get("TRACKER_POLL_SECS", "10"))
+# How often (seconds) to poll the CLOB / Data API for new trades.
+# Lower = faster copy-trade detection.  CLOB API handles ~4 req/s fine.
+# Default 2 s gives ~2–4 s detection lag (on top of any API indexing delay).
+TRACKER_POLL_SECS: float = float(os.environ.get("TRACKER_POLL_SECS", "2"))
 
 # Copy-trade mode.  Can be overridden at startup with --copy-blind /
 # --copy-gated flags, or toggled live from the interactive console.
