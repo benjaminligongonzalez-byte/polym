@@ -146,6 +146,10 @@ class TraderTracker:
         self._target_wallet_value: float | None = None
         self._wallet_value_ts: float = 0.0  # monotonic time of last fetch
 
+        # Copy-trade warmup: suppress signals for this many seconds after startup
+        # to avoid acting on the initial high-lag backlog of trades.
+        self._COPY_WARMUP_SECS: float = 60.0
+
         # Stats
         self._total_seen:  int = 0
         self._started_at:  float = 0.0
@@ -265,7 +269,14 @@ class TraderTracker:
                     self._log_trade(trade)
                     self._update_positions(trade)
                     if self._on_trade:
-                        asyncio.create_task(self._on_trade(trade))
+                        uptime = time.monotonic() - self._started_at
+                        if uptime < self._COPY_WARMUP_SECS:
+                            log.info(
+                                "Tracker: warmup (%ds remaining) — copy suppressed",
+                                int(self._COPY_WARMUP_SECS - uptime),
+                            )
+                        else:
+                            asyncio.create_task(self._on_trade(trade))
             except Exception as exc:
                 log.debug("TraderTracker: failed to process %s: %s", tid[:12], exc)
 
