@@ -57,6 +57,16 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+# ── ANSI colour constants (terminal display) ──────────────────────────────────
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_CYAN   = "\033[96m"
+_ORANGE = "\033[33m"
+
 
 # ---------------------------------------------------------------------------
 # Open position tracking
@@ -308,7 +318,13 @@ class OrderManager:
         direction: str,
         price_move_pct: float,
     ) -> None:
-        log.info("MOMENTUM  %-3s  %s  %.3f%%", symbol, direction, price_move_pct)
+        dir_arrow = f"{_GREEN}▲ UP{_RESET}" if direction == "UP" else f"{_RED}▼ DOWN{_RESET}"
+        log.info(
+            "%sMOMENTUM%s  %s%s%s  %s  %.3f%%",
+            _YELLOW, _RESET,
+            _CYAN, symbol, _RESET,
+            dir_arrow, price_move_pct,
+        )
 
         if not self._risk_ok(symbol):
             return
@@ -542,17 +558,19 @@ class OrderManager:
 
             profit_per_share = current_mid - pos.entry_price
             total_profit_usdc = profit_per_share * pos.shares
+            pnl_col = _GREEN if total_profit_usdc >= 0 else _RED
+            close_type = "stop-loss" if exit_reason.startswith("stop-loss") else "early-exit"
+            exit_tag = f"{_RED}[STOP-LOSS]{_RESET}" if close_type == "stop-loss" else f"{_GREEN}[EXIT]{_RESET}"
             log.info(
-                "EXIT  %-3s  %s  %s  entry=%.4f  now=%.4f  "
-                "profit=$%+.2f (%.1f%%)  t_rem=%.0fs  [%s]",
-                pos.symbol, cid[:8], pos.bet,
+                "%s  %-3s  %s  %s  entry=%.4f → now=%.4f  "
+                "%sprofit=$%+.2f (%.1f%%)%s  t_rem=%.0fs  [%s]",
+                exit_tag, pos.symbol, cid[:8], pos.bet,
                 pos.entry_price, current_mid,
-                total_profit_usdc,
-                profit_per_share / pos.entry_price * 100,
+                pnl_col, total_profit_usdc,
+                profit_per_share / pos.entry_price * 100, _RESET,
                 t_rem,
                 exit_reason,
             )
-            close_type = "stop-loss" if exit_reason.startswith("stop-loss") else "early-exit"
             await self._sell_position(pos, current_mid, close_type=close_type)
 
     async def _sell_position(
@@ -561,12 +579,15 @@ class OrderManager:
         """Place a sell limit order slightly below mid to ensure quick fill."""
         sell_price = round(max(current_mid - config.RISK.slippage_tolerance, 0.01), 4)
 
+        dir_col = _GREEN if pos.bet == "Up" else _RED
         log.info(
-            "[EXIT]  Sell %-4s  %s  @ %.4f  (%.2f shares / est. $%.2f USDC)"
-            "  wallet=$%.2f",
-            pos.bet, pos.question[:50],
+            "%s[SELL]%s  %s%-4s%s  %s  @ %.4f  (%.2f shares / est. $%.2f USDC)"
+            "  %swallet=$%.2f%s",
+            _YELLOW, _RESET,
+            dir_col, pos.bet, _RESET,
+            pos.question[:50],
             sell_price, pos.shares, sell_price * pos.shares,
-            self._wallet_balance,
+            _BOLD, self._wallet_balance, _RESET,
         )
 
         resp = await self._client.create_limit_order(
@@ -599,9 +620,10 @@ class OrderManager:
             ))
             self._positions.pop(pos.condition_id, None)
             self._last_trade[pos.condition_id] = time.monotonic()
+            pnl_col2 = _GREEN if pnl >= 0 else _RED
             log.info(
-                "Position exited early.  cid=%s  pnl=$%+.4f  total_exposure=$%.2f",
-                pos.condition_id[:8], pnl, self.total_exposure,
+                "Position closed.  cid=%s  %spnl=$%+.4f%s  total_exposure=$%.2f",
+                pos.condition_id[:8], pnl_col2, pnl, _RESET, self.total_exposure,
             )
 
     # ------------------------------------------------------------------
@@ -624,12 +646,17 @@ class OrderManager:
         limit_price = round(min(mid + config.RISK.slippage_tolerance, 0.99), 4)
         shares = round(order_usdc / limit_price, 2)
 
+        dir_col = _GREEN if token_label == "Up" else _RED
         log.info(
-            "[%s]  Buy %-4s  %s  @ %.4f  (%.2f shares / $%.2f USDC)"
-            "  wallet=$%.2f  deployed=$%.2f",
-            source, token_label, question[:50],
+            "%s[BUY]%s  %s%-4s%s  %s  @ %.4f  "
+            "(%.2f shares / $%.2f USDC)  "
+            "%swallet=$%.2f%s  deployed=$%.2f",
+            _CYAN, _RESET,
+            dir_col, token_label, _RESET,
+            question[:50],
             limit_price, shares, order_usdc,
-            self._wallet_balance, self.total_exposure,
+            _BOLD, self._wallet_balance, _RESET,
+            self.total_exposure,
         )
 
         resp = await self._client.create_limit_order(
@@ -659,7 +686,8 @@ class OrderManager:
                 source=strategy_tag,
             )
             log.info(
-                "Order recorded.  cid=%s  total_exposure=$%.2f / $%.2f (%.0f%%)",
+                "%sOrder recorded%s  cid=%s  total_exposure=$%.2f / $%.2f (%.0f%%)",
+                _DIM, _RESET,
                 cid[:8], self.total_exposure,
                 self._max_exposure_usdc,
                 (self.total_exposure / self._max_exposure_usdc * 100)
@@ -741,42 +769,48 @@ class OrderManager:
         surge_cap = self._wallet_balance * config.RISK.per_symbol_surge_fraction
         status = "⏸  PAUSED  (no new orders)" if self._paused else "▶  RUNNING"
 
+        pnl_col    = _GREEN if realized_pnl >= 0 else _RED
+        pnl_sign   = "+" if realized_pnl >= 0 else ""
+        wr_col     = _GREEN if win_rate >= 50 else _RED
+        depl_pct   = f" ({deployed / self._wallet_balance * 100:.1f}%)" if self._wallet_balance else ""
+
         lines = [
-            "═" * 60,
-            f"  POLYMARKET BOT  —  uptime {h:02d}h {m:02d}m {s:02d}s  |  {status}",
-            "─" * 60,
-            f"  Wallet balance  : ${self._wallet_balance:>10.4f} USDC",
-            f"  Deployed        : ${deployed:>10.4f} USDC  ({deployed / self._wallet_balance * 100:.1f}%)" if self._wallet_balance else f"  Deployed        : ${deployed:>10.4f} USDC",
+            f"{_BOLD}{'═' * 60}{_RESET}",
+            f"  {_BOLD}POLYMARKET BOT{_RESET}  —  uptime {h:02d}h {m:02d}m {s:02d}s  |  {status}",
+            f"{'─' * 60}",
+            f"  {_BOLD}Wallet balance{_RESET}  : {_BOLD}${self._wallet_balance:>10.4f}{_RESET} USDC",
+            f"  Deployed        : ${deployed:>10.4f} USDC{depl_pct}",
             f"  Available       : ${self._wallet_balance - deployed:>10.4f} USDC",
-            f"  Sym cap (base)  : ${base_cap:>10.2f}   (conviction=0.0 / momentum)",
-            f"  Sym cap (surge) : ${surge_cap:>10.2f}   (conviction=1.0 / near-certain snipe)",
-            "─" * 60,
-            f"  Orders placed   : {self._orders_placed}",
-            f"  Open positions  : {len(self._positions)}",
+            f"  {_DIM}Sym cap (base)  : ${base_cap:>10.2f}   (conviction=0.0 / momentum){_RESET}",
+            f"  {_DIM}Sym cap (surge) : ${surge_cap:>10.2f}   (conviction=1.0 / near-certain snipe){_RESET}",
+            f"{'─' * 60}",
+            f"  Orders placed   : {_CYAN}{self._orders_placed}{_RESET}",
+            f"  Open positions  : {_CYAN}{len(self._positions)}{_RESET}",
             f"  Closed trades   : {len(self._closed_trades)}",
-            f"    ├ Early exits : {len(priced)}  (wins={len(wins)}  losses={len(losses)})",
+            f"    ├ Early exits : {len(priced)}  ({_GREEN}wins={len(wins)}{_RESET}  {_RED}losses={len(losses)}{_RESET})",
             f"    └ Resolved    : {len(resolved)}  (P&L pending market resolution)",
-            "─" * 60,
-            f"  Realized P&L    : ${realized_pnl:>+10.4f} USDC",
-            f"  Win rate        : {win_rate:>6.1f}%  ({len(wins)}/{len(priced)} priced trades)",
+            f"{'─' * 60}",
+            f"  Realized P&L    : {pnl_col}{_BOLD}${pnl_sign}{realized_pnl:.4f}{_RESET} USDC",
+            f"  Win rate        : {wr_col}{_BOLD}{win_rate:.1f}%{_RESET}  ({len(wins)}/{len(priced)} priced trades)",
         ]
 
         # Per-symbol breakdown
         symbols = sorted({t.symbol for t in self._closed_trades} | {p.symbol for p in self._positions.values()})
         if symbols:
-            lines.append("─" * 60)
+            lines.append(f"{'─' * 60}")
             lines.append("  Per-symbol breakdown:")
             for sym in symbols:
                 sym_priced = [t for t in priced if t.symbol == sym]
                 sym_open   = sum(1 for p in self._positions.values() if p.symbol == sym)
                 sym_pnl    = sum(t.pnl_usdc for t in sym_priced)
                 sym_wins   = sum(1 for t in sym_priced if t.pnl_usdc > 0)
+                sym_col    = _GREEN if sym_pnl >= 0 else _RED
                 lines.append(
-                    f"  {sym:<4}  open={sym_open}  closed={len(sym_priced)}"
-                    f"  wins={sym_wins}  pnl=${sym_pnl:+.4f}"
+                    f"  {_CYAN}{sym:<4}{_RESET}  open={sym_open}  closed={len(sym_priced)}"
+                    f"  {_GREEN}wins={sym_wins}{_RESET}  {sym_col}pnl=${sym_pnl:+.4f}{_RESET}"
                 )
 
-        lines.append("═" * 60)
+        lines.append(f"{_BOLD}{'═' * 60}{_RESET}")
         return "\n".join(lines)
 
     def positions_report(self) -> str:
@@ -787,37 +821,42 @@ class OrderManager:
         now = time.monotonic()
         total_cost = sum(p.cost_usdc for p in self._positions.values())
         lines = [
-            "═" * 60,
-            f"  OPEN POSITIONS  ({len(self._positions)} bets  /  ${total_cost:.2f} at risk)",
-            "═" * 60,
+            f"{_BOLD}{'═' * 60}{_RESET}",
+            f"  {_BOLD}OPEN POSITIONS{_RESET}  ({_CYAN}{len(self._positions)} bets{_RESET}  /  ${total_cost:.2f} at risk)",
+            f"{_BOLD}{'═' * 60}{_RESET}",
         ]
         for i, pos in enumerate(self._positions.values(), 1):
             age_s = int(now - pos.entered_at)
             age_m, age_s2 = divmod(age_s, 60)
-            # Look up remaining market time from cache if available
             market = self._cache.get_market(pos.condition_id)
             t_rem = market.time_remaining_secs if market else None
             if t_rem is not None and t_rem > 0:
                 tr_m, tr_s = divmod(int(t_rem), 60)
                 t_rem_str = f"{tr_m}m{tr_s:02d}s left"
+                # Colour by urgency: yellow <3min, red <1min
+                t_col = _RED if t_rem < 60 else (_YELLOW if t_rem < 180 else _GREEN)
+                t_rem_str = f"{t_col}{t_rem_str}{_RESET}"
             elif t_rem is not None:
-                t_rem_str = "EXPIRED"
+                t_rem_str = f"{_RED}EXPIRED{_RESET}"
             else:
-                t_rem_str = "t_rem unknown"
+                t_rem_str = f"{_DIM}t_rem unknown{_RESET}"
 
+            dir_col = _GREEN if pos.bet == "Up" else _RED
+            src_col = _YELLOW if pos.source == "SNIPE" else _CYAN if pos.source == "ARB" else _DIM
             lines.append(
-                f"  [{i}] {pos.symbol} {pos.bet.upper():<4}  "
-                f"strategy={pos.source:<9}  "
-                f"entry=${pos.entry_price:.4f}  "
+                f"  [{i}] {_BOLD}{_CYAN}{pos.symbol}{_RESET} "
+                f"{dir_col}{pos.bet.upper():<4}{_RESET}  "
+                f"{src_col}{pos.source:<9}{_RESET}  "
+                f"entry={_BOLD}${pos.entry_price:.4f}{_RESET}  "
                 f"shares={pos.shares:.2f}  cost=${pos.cost_usdc:.2f}"
             )
             lines.append(
                 f"       age={age_m}m{age_s2:02d}s  {t_rem_str}  "
-                f"cid={pos.condition_id[:10]}…"
+                f"{_DIM}cid={pos.condition_id[:10]}…{_RESET}"
             )
-            lines.append(f"       {pos.question}")
+            lines.append(f"       {_DIM}{pos.question}{_RESET}")
             if i < len(self._positions):
-                lines.append("  " + "·" * 56)
+                lines.append(f"  {'·' * 56}")
 
-        lines.append("═" * 60)
+        lines.append(f"{_BOLD}{'═' * 60}{_RESET}")
         return "\n".join(lines)

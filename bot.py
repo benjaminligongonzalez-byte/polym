@@ -57,6 +57,15 @@ import time
 
 import config
 from feeds.binance import BinanceFeed
+
+# ── ANSI colours (terminal display) ──────────────────────────────────────────
+_RESET  = "\033[0m"
+_BOLD   = "\033[1m"
+_DIM    = "\033[2m"
+_GREEN  = "\033[92m"
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_CYAN   = "\033[96m"
 from feeds.coinbase import CoinbaseFeed
 from feeds.aggregator import PriceAggregator, make_feed_callback
 from polymarket.client import PolymarketClient
@@ -192,10 +201,23 @@ class Bot:
             asyncio.create_task(self._console_loop(), name="console")
         )
 
+        mode_label = f"{_YELLOW}PAPER TRADE{_RESET}" if config.PAPER_TRADE else f"{_GREEN}LIVE{_RESET}"
+        strats = "  ".join(filter(None, [
+            f"{_CYAN}Momentum{_RESET}" if self._use_momentum else "",
+            f"{_CYAN}ARB+Snipe{_RESET}" if self._use_arb else "",
+        ]))
+        print(
+            f"\n{_BOLD}{'═'*66}{_RESET}\n"
+            f"  {_BOLD}POLYMARKET TRADING BOT{_RESET}  —  {mode_label}  |  {strats}\n"
+            f"  Strategies: {strats}  |  Tasks: {len(self._tasks)}\n"
+            f"  Commands: {_BOLD}s{_RESET}=stats  {_BOLD}p{_RESET}=positions  "
+            f"{_BOLD}m{_RESET}=markets  {_BOLD}pause{_RESET}  {_BOLD}drain{_RESET}  "
+            f"{_BOLD}h{_RESET}=help  {_BOLD}q{_RESET}=quit\n"
+            f"{_BOLD}{'═'*66}{_RESET}\n",
+            flush=True,
+        )
         log.info(
-            "Bot running with %d tasks. Feeds: Binance+Coinbase (BTC/ETH/XRP/SOL). "
-            "Type 's' + Enter for stats, 'p' for positions, 'h' for help. "
-            "Press Ctrl+C to stop.",
+            "Bot running with %d tasks. Feeds: Binance+Coinbase (BTC/ETH/XRP/SOL).",
             len(self._tasks),
         )
         await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -234,8 +256,7 @@ Commands (type and press Enter):
         """
         loop = asyncio.get_running_loop()
         print(
-            "\n[console] Interactive console ready. "
-            "Type 's' + Enter for stats, 'h' for help.\n",
+            f"\n{_DIM}[console] Ready — type a command + Enter.{_RESET}\n",
             flush=True,
         )
         while True:
@@ -264,16 +285,34 @@ Commands (type and press Enter):
             elif cmd in ("m", "markets"):
                 mkts = self._market_cache.all_markets()
                 if mkts:
-                    lines = [f"  Active markets ({len(mkts)}):"]
-                    for m in mkts:
+                    lines = [
+                        f"{_BOLD}{'─'*66}{_RESET}",
+                        f"  {_BOLD}ACTIVE MARKETS{_RESET}  ({_CYAN}{len(mkts)}{_RESET} windows)",
+                        f"{_BOLD}{'─'*66}{_RESET}",
+                    ]
+                    for m in sorted(mkts, key=lambda x: x.symbol):
                         t = m.time_remaining_secs
-                        h, rem = divmod(int(max(t, 0)), 3600)
-                        mi, se = divmod(rem, 60)
-                        lines.append(
-                            f"  {m.symbol:<4} t_rem={h:02d}h{mi:02d}m{se:02d}s"
-                            f"  strike={'$'+str(round(m.strike_price,4)) if m.strike_price else 'unlocked':>12}"
-                            f"  {m.question[:45]}"
+                        mi, se = divmod(int(max(t, 0)), 60)
+                        # Time bar — fill based on fraction of 900s window remaining
+                        frac = max(0.0, min(1.0, t / 900.0))
+                        bar_fill = round(frac * 12)
+                        bar = "█" * bar_fill + "░" * (12 - bar_fill)
+                        # Colour by urgency
+                        t_col = _RED if t < 60 else (_YELLOW if t < 180 else _GREEN)
+                        strike_str = (
+                            f"${m.strike_price:,.4f}"
+                            if m.strike_price else f"{_DIM}unlocked{_RESET}"
                         )
+                        up_mid = f"{m.up_mid:.2f}" if m.up_mid else " ─ "
+                        lines.append(
+                            f"  {_CYAN}{m.symbol:<4}{_RESET}"
+                            f"  [{t_col}{bar}{_RESET}]"
+                            f"  {t_col}{mi:02d}m{se:02d}s{_RESET}"
+                            f"  strike={strike_str:<14}"
+                            f"  up_mid={_BOLD}{up_mid}{_RESET}"
+                            f"  {_DIM}{m.question[:42]}{_RESET}"
+                        )
+                    lines.append(f"{'─'*66}")
                     print("\n".join(lines), flush=True)
                 else:
                     print("  No markets in cache.", flush=True)
