@@ -242,7 +242,7 @@ class Bot:
             self._tracker = TraderTracker(
                 address=config.TRACK_ADDRESS,
                 on_trade=self._on_tracked_trade,
-                price_feed=self._aggregator.consensus_price,
+                price_feed=self._aggregator.price_at,
             )
             self._tasks.append(
                 asyncio.create_task(self._tracker.run(), name="trader-tracker")

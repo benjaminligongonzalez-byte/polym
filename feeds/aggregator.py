@@ -14,6 +14,7 @@ callback without coupling the feed objects to strategy objects.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import logging
 import time
 from dataclasses import dataclass
@@ -46,11 +47,17 @@ class PriceAggregator:
     Subscribe additional async handlers via add_subscriber().
     """
 
+    # Keep this many seconds of price history for historical lookups
+    _HISTORY_WINDOW = 300  # 5 minutes
+
     def __init__(self) -> None:
         # symbol → {source_name → SourcePrice}
         self._prices: dict[str, dict[str, SourcePrice]] = {}
         # Downstream subscribers that also want every tick
         self._subscribers: list[PriceCallback] = []
+        # Rolling history for price_at() lookups: symbol → [(ts, price), ...]
+        # Kept sorted by ts; trimmed to _HISTORY_WINDOW seconds.
+        self._history: dict[str, list[tuple[float, float]]] = {}
 
     # ------------------------------------------------------------------
     # Subscription management
@@ -73,6 +80,14 @@ class PriceAggregator:
             self._prices[symbol] = {}
 
         self._prices[symbol][source] = SourcePrice(source=source, price=price, ts=ts)
+
+        # Append to rolling history and trim old entries
+        hist = self._history.setdefault(symbol, [])
+        hist.append((ts, price))
+        cutoff = ts - self._HISTORY_WINDOW
+        # Trim from front (oldest) while stale
+        while hist and hist[0][0] < cutoff:
+            hist.pop(0)
 
         # Forward to all downstream subscribers
         for cb in self._subscribers:
@@ -99,6 +114,24 @@ class PriceAggregator:
         if len(sorted_prices) % 2 == 0:
             return (sorted_prices[mid - 1] + sorted_prices[mid]) / 2
         return sorted_prices[mid]
+
+    def price_at(self, symbol: str, timestamp: float) -> Optional[float]:
+        """
+        Return the closest recorded price for *symbol* at or before *timestamp*.
+        Uses the rolling history buffer (last _HISTORY_WINDOW seconds).
+        Returns None if no history is available for that symbol.
+        """
+        hist = self._history.get(symbol)
+        if not hist:
+            return None
+        # Binary search for insertion point of timestamp
+        ts_list = [entry[0] for entry in hist]
+        idx = bisect.bisect_right(ts_list, timestamp)
+        if idx == 0:
+            # timestamp is before all recorded prices — return earliest
+            return hist[0][1]
+        # Return the price at or just before the requested timestamp
+        return hist[idx - 1][1]
 
     def source_prices(self, symbol: str) -> dict[str, Optional[float]]:
         """Return the latest price per source (None if stale)."""

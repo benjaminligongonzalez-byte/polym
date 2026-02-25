@@ -142,11 +142,11 @@ class TraderTracker:
         self,
         address: str,
         on_trade:   Callable[[TrackedTrade], Awaitable[None]] | None = None,
-        price_feed: Callable[[str], float | None] | None = None,
+        price_feed: Callable[[str, float], float | None] | None = None,
     ) -> None:
         self._address    = address.lower()
         self._on_trade   = on_trade
-        self._price_feed = price_feed  # consensus_price(symbol) → spot USD price
+        self._price_feed = price_feed  # price_at(symbol, timestamp) → spot USD price
         self._session: aiohttp.ClientSession | None = None
 
         # Deduplication: trade IDs / tx hashes we've already processed
@@ -587,7 +587,7 @@ class TraderTracker:
         pos_before  = self._net_shares.get(key, 0.0)
         delta       = trade.size if trade.side == "BUY" else -trade.size
         pos_after   = pos_before + delta
-        spot        = self._price_feed(trade.symbol) if self._price_feed and trade.symbol else None
+        spot        = self._price_feed(trade.symbol, trade.timestamp) if self._price_feed and trade.symbol else None
         self._session_seq += 1
         self._logged_trades.append(LoggedTrade(
             trade      = trade,
