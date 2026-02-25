@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
 import aiohttp
+from web3 import Web3
 
 import config
 
@@ -361,9 +362,11 @@ class TraderTracker:
         assert self._session is not None
         url = f"{config.CLOB_HOST}/trades"
 
+        checksum_addr = Web3.to_checksum_address(self._address)
+
         async def _fetch_role(role_param: str) -> list[dict]:
             try:
-                params = {role_param: self._address, "limit": 100}
+                params = {role_param: checksum_addr, "limit": 100}
                 async with self._session.get(url, params=params) as resp:
                     if resp.status != 200:
                         return []
