@@ -53,6 +53,7 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 
 import config
 from feeds.binance import BinanceFeed
@@ -186,8 +187,14 @@ class Bot:
                 asyncio.create_task(self._arb.run(), name="arb-scanner")
             )
 
+        # 7. Start interactive console (stdin command reader)
+        self._tasks.append(
+            asyncio.create_task(self._console_loop(), name="console")
+        )
+
         log.info(
             "Bot running with %d tasks. Feeds: Binance+Coinbase (BTC/ETH/XRP/SOL). "
+            "Type 's' + Enter for stats, 'p' for positions, 'h' for help. "
             "Press Ctrl+C to stop.",
             len(self._tasks),
         )
@@ -203,6 +210,84 @@ class Bot:
             task.cancel()
         await self._market_cache.stop()
         log.info("Bot stopped.")
+
+    # ------------------------------------------------------------------
+    # Interactive console
+    # ------------------------------------------------------------------
+
+    _CONSOLE_HELP = """\
+Commands (type and press Enter):
+  s  /  status     — full stats: balance, P&L, win rate, trade counts
+  p  /  positions  — open positions detail
+  m  /  markets    — active markets in cache
+  h  /  help       — this message
+  q  /  quit       — graceful shutdown
+"""
+
+    async def _console_loop(self) -> None:
+        """
+        Reads lines from stdin without blocking the event loop.
+        Uses run_in_executor so it works on both Windows and Linux.
+        """
+        loop = asyncio.get_running_loop()
+        print(
+            "\n[console] Interactive console ready. "
+            "Type 's' + Enter for stats, 'h' for help.\n",
+            flush=True,
+        )
+        while True:
+            try:
+                raw = await loop.run_in_executor(None, sys.stdin.readline)
+            except Exception:
+                break
+            cmd = raw.strip().lower()
+            if not cmd:
+                continue
+
+            om = self._order_manager
+
+            if cmd in ("s", "status", "stats"):
+                if om:
+                    print(om.stats_report(), flush=True)
+                else:
+                    print("  OrderManager not ready yet.", flush=True)
+
+            elif cmd in ("p", "positions"):
+                if om:
+                    print(om.positions_report(), flush=True)
+                else:
+                    print("  OrderManager not ready yet.", flush=True)
+
+            elif cmd in ("m", "markets"):
+                mkts = self._market_cache.all_markets()
+                if mkts:
+                    lines = [f"  Active markets ({len(mkts)}):"]
+                    for m in mkts:
+                        t = m.time_remaining_secs
+                        h, rem = divmod(int(max(t, 0)), 3600)
+                        mi, se = divmod(rem, 60)
+                        lines.append(
+                            f"  {m.symbol:<4} t_rem={h:02d}h{mi:02d}m{se:02d}s"
+                            f"  strike={'$'+str(round(m.strike_price,4)) if m.strike_price else 'unlocked':>12}"
+                            f"  {m.question[:45]}"
+                        )
+                    print("\n".join(lines), flush=True)
+                else:
+                    print("  No markets in cache.", flush=True)
+
+            elif cmd in ("h", "help"):
+                print(self._CONSOLE_HELP, flush=True)
+
+            elif cmd in ("q", "quit", "exit"):
+                print("  Shutting down…", flush=True)
+                loop.create_task(self.stop())
+                break
+
+            else:
+                print(
+                    f"  Unknown command '{cmd}'. Type 'h' for help.",
+                    flush=True,
+                )
 
 
 # ---------------------------------------------------------------------------

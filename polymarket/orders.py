@@ -44,8 +44,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional
 
 from feeds.aggregator import PriceAggregator
 from polymarket.client import PolymarketClient
@@ -76,6 +76,31 @@ class OpenPosition:
     strike_price: float # strike K used in the fair-value model
     is_snipe: bool
     entered_at: float   # time.monotonic()
+    source: str = ""    # "MOMENTUM", "ARB", "SNIPE"
+
+
+@dataclass
+class ClosedTrade:
+    """Historical record of a completed bet."""
+    condition_id: str
+    symbol: str
+    bet: str                    # "Up" or "Down"
+    question: str
+    entry_price: float
+    exit_price: Optional[float] # None if resolved (we don't yet know outcome)
+    shares: float
+    cost_usdc: float
+    pnl_usdc: Optional[float]   # None if resolved without early exit
+    source: str                 # "MOMENTUM", "ARB", "SNIPE"
+    close_type: str             # "early-exit" | "stop-loss" | "resolved"
+    opened_at: float            # time.monotonic()
+    closed_at: float            # time.monotonic()
+
+    @property
+    def is_win(self) -> Optional[bool]:
+        if self.pnl_usdc is None:
+            return None
+        return self.pnl_usdc > 0
 
 
 class OrderManager:
@@ -101,6 +126,10 @@ class OrderManager:
         self._last_trade: dict[str, float] = {}
         # condition_id → OpenPosition (one position per market at a time)
         self._positions: dict[str, OpenPosition] = {}
+        # Trade history
+        self._closed_trades: list[ClosedTrade] = []
+        self._orders_placed: int = 0      # total orders sent (momentum + arb)
+        self._session_start: float = time.monotonic()
 
     # ------------------------------------------------------------------
     # Wallet balance management
@@ -424,9 +453,12 @@ class OrderManager:
                 t_rem,
                 exit_reason,
             )
-            await self._sell_position(pos, current_mid)
+            close_type = "stop-loss" if exit_reason.startswith("stop-loss") else "early-exit"
+            await self._sell_position(pos, current_mid, close_type=close_type)
 
-    async def _sell_position(self, pos: OpenPosition, current_mid: float) -> None:
+    async def _sell_position(
+        self, pos: OpenPosition, current_mid: float, close_type: str = "early-exit"
+    ) -> None:
         """Place a sell limit order slightly below mid to ensure quick fill."""
         sell_price = round(max(current_mid - config.RISK.slippage_tolerance, 0.01), 4)
 
@@ -446,11 +478,27 @@ class OrderManager:
         )
 
         if resp is not None:
+            pnl = round((sell_price - pos.entry_price) * pos.shares, 4)
+            self._closed_trades.append(ClosedTrade(
+                condition_id=pos.condition_id,
+                symbol=pos.symbol,
+                bet=pos.bet,
+                question=pos.question,
+                entry_price=pos.entry_price,
+                exit_price=sell_price,
+                shares=pos.shares,
+                cost_usdc=pos.cost_usdc,
+                pnl_usdc=pnl,
+                source=pos.source,
+                close_type=close_type,
+                opened_at=pos.entered_at,
+                closed_at=time.monotonic(),
+            ))
             self._positions.pop(pos.condition_id, None)
             self._last_trade[pos.condition_id] = time.monotonic()
             log.info(
-                "Position exited early.  cid=%s  total_exposure=$%.2f",
-                pos.condition_id[:8], self.total_exposure,
+                "Position exited early.  cid=%s  pnl=%+$.4f  total_exposure=$%.2f",
+                pos.condition_id[:8], pnl, self.total_exposure,
             )
 
     # ------------------------------------------------------------------
@@ -489,7 +537,10 @@ class OrderManager:
         )
 
         if resp is not None:
+            self._orders_placed += 1
             self._last_trade[cid] = time.monotonic()
+            # First word of source is the clean strategy tag ("MOMENTUM"/"ARB"/"SNIPE")
+            strategy_tag = source.split()[0]
             self._positions[cid] = OpenPosition(
                 condition_id=cid,
                 token_id=token_id,
@@ -502,6 +553,7 @@ class OrderManager:
                 strike_price=strike_price,
                 is_snipe=is_snipe,
                 entered_at=time.monotonic(),
+                source=strategy_tag,
             )
             log.info(
                 "Order recorded.  cid=%s  total_exposure=$%.2f / $%.2f (%.0f%%)",
@@ -517,5 +569,103 @@ class OrderManager:
 
     def record_resolution(self, condition_id: str) -> None:
         """Call when a market resolves to free up tracked position."""
-        self._positions.pop(condition_id, None)
+        pos = self._positions.pop(condition_id, None)
         self._last_trade.pop(condition_id, None)
+        if pos is not None:
+            # P&L unknown until the oracle sets the final price; mark as resolved.
+            self._closed_trades.append(ClosedTrade(
+                condition_id=condition_id,
+                symbol=pos.symbol,
+                bet=pos.bet,
+                question=pos.question,
+                entry_price=pos.entry_price,
+                exit_price=None,
+                shares=pos.shares,
+                cost_usdc=pos.cost_usdc,
+                pnl_usdc=None,
+                source=pos.source,
+                close_type="resolved",
+                opened_at=pos.entered_at,
+                closed_at=time.monotonic(),
+            ))
+
+    # ------------------------------------------------------------------
+    # Live stats / console reporting
+    # ------------------------------------------------------------------
+
+    def stats_report(self) -> str:
+        """Return a multi-line formatted stats summary for the console."""
+        uptime_secs = time.monotonic() - self._session_start
+        h, rem = divmod(int(uptime_secs), 3600)
+        m, s   = divmod(rem, 60)
+
+        # Closed trades with known P&L (early exits and stop-losses)
+        priced = [t for t in self._closed_trades if t.pnl_usdc is not None]
+        wins   = [t for t in priced if t.pnl_usdc > 0]
+        losses = [t for t in priced if t.pnl_usdc <= 0]
+        resolved = [t for t in self._closed_trades if t.close_type == "resolved"]
+
+        realized_pnl = sum(t.pnl_usdc for t in priced)
+        win_rate = len(wins) / len(priced) * 100 if priced else 0.0
+
+        # Unrealised P&L from open positions (mark-to-market not available here,
+        # so show cost basis only)
+        deployed = self.total_exposure
+
+        lines = [
+            "═" * 60,
+            f"  POLYMARKET BOT  —  uptime {h:02d}h {m:02d}m {s:02d}s",
+            "─" * 60,
+            f"  Wallet balance  : ${self._wallet_balance:>10.4f} USDC",
+            f"  Deployed        : ${deployed:>10.4f} USDC  ({deployed / self._wallet_balance * 100:.1f}%)" if self._wallet_balance else f"  Deployed        : ${deployed:>10.4f} USDC",
+            f"  Available       : ${self._wallet_balance - deployed:>10.4f} USDC",
+            "─" * 60,
+            f"  Orders placed   : {self._orders_placed}",
+            f"  Open positions  : {len(self._positions)}",
+            f"  Closed trades   : {len(self._closed_trades)}",
+            f"    ├ Early exits : {len(priced)}  (wins={len(wins)}  losses={len(losses)})",
+            f"    └ Resolved    : {len(resolved)}  (P&L pending market resolution)",
+            "─" * 60,
+            f"  Realized P&L    : ${realized_pnl:>+10.4f} USDC",
+            f"  Win rate        : {win_rate:>6.1f}%  ({len(wins)}/{len(priced)} priced trades)",
+        ]
+
+        # Per-symbol breakdown
+        symbols = sorted({t.symbol for t in self._closed_trades} | {p.symbol for p in self._positions.values()})
+        if symbols:
+            lines.append("─" * 60)
+            lines.append("  Per-symbol breakdown:")
+            for sym in symbols:
+                sym_priced = [t for t in priced if t.symbol == sym]
+                sym_open   = sum(1 for p in self._positions.values() if p.symbol == sym)
+                sym_pnl    = sum(t.pnl_usdc for t in sym_priced)
+                sym_wins   = sum(1 for t in sym_priced if t.pnl_usdc > 0)
+                lines.append(
+                    f"  {sym:<4}  open={sym_open}  closed={len(sym_priced)}"
+                    f"  wins={sym_wins}  pnl=${sym_pnl:+.4f}"
+                )
+
+        lines.append("═" * 60)
+        return "\n".join(lines)
+
+    def positions_report(self) -> str:
+        """Return details of all currently open positions."""
+        if not self._positions:
+            return "  No open positions."
+
+        now = time.monotonic()
+        lines = [
+            "─" * 60,
+            f"  Open positions ({len(self._positions)}):",
+            "─" * 60,
+        ]
+        for pos in self._positions.values():
+            age_s = int(now - pos.entered_at)
+            lines.append(
+                f"  [{pos.source}] {pos.symbol} {pos.bet:4}  "
+                f"entry=${pos.entry_price:.4f}  shares={pos.shares:.2f}  "
+                f"cost=${pos.cost_usdc:.2f}  age={age_s}s"
+            )
+            lines.append(f"    {pos.question[:55]}")
+        lines.append("─" * 60)
+        return "\n".join(lines)
