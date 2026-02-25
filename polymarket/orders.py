@@ -144,6 +144,7 @@ class OrderManager:
         self._blind_copy_count: int = 0     # blind copy orders placed
         self._blind_positions: list[OpenPosition] = []  # tracked separately from _positions
                                             # so check_exits doesn't prematurely resolve them
+        self._mid_cache: dict[str, float] = {}  # token_id → last fetched mid (for unrealized P&L)
         self._session_start: float = time.monotonic()
         # Paper-trade running P&L (applied to wallet balance so sizing stays accurate)
         self._paper_pnl: float = 0.0
@@ -685,6 +686,7 @@ class OrderManager:
             # Fetch current market price for the token we hold
             try:
                 current_mid = await self._client.get_midpoint(pos.token_id)
+                self._mid_cache[pos.token_id] = current_mid
             except Exception as exc:
                 log.debug("Exit check: midpoint fetch failed %s: %s", cid[:8], exc)
                 continue
@@ -797,6 +799,16 @@ class OrderManager:
                 exit_reason,
             )
             await self._sell_position(pos, current_mid, close_type=close_type)
+
+        # Refresh midpoint cache for blind copy positions (no exit logic — just pricing)
+        for pos in self._blind_positions:
+            if not pos.token_id:
+                continue
+            try:
+                mid = await self._client.get_midpoint(pos.token_id)
+                self._mid_cache[pos.token_id] = mid
+            except Exception:
+                pass
 
     async def _sell_position(
         self, pos: OpenPosition, current_mid: float, close_type: str = "early-exit"
@@ -972,6 +984,55 @@ class OrderManager:
     # Live stats / console reporting
     # ------------------------------------------------------------------
 
+    def _unrealized_pnl_lines(self) -> list[str]:
+        """
+        Compute unrealized P&L from cached midpoints for all open positions
+        (own-strategy + blind copies).  Returns formatted lines for stats_report.
+        Positions with no cached mid are shown as '? (no price yet)'.
+        """
+        all_positions = list(self._positions.values()) + self._blind_positions
+        if not all_positions:
+            return []
+
+        lines: list[str] = []
+        total_unrealized = 0.0
+        any_missing = False
+        per_pos: list[tuple[str, float, float]] = []  # (label, cost, unrealized)
+
+        for pos in all_positions:
+            mid = self._mid_cache.get(pos.token_id)
+            if mid is None:
+                any_missing = True
+                continue
+            unrealized = (mid - pos.entry_price) * pos.shares
+            total_unrealized += unrealized
+            label = f"{pos.symbol}/{pos.bet}" if pos.symbol != "?" else pos.bet
+            per_pos.append((label, pos.cost_usdc, unrealized))
+
+        if not per_pos and any_missing:
+            lines.append(f"  Unrealized P&L  : {_DIM}waiting for first price update…{_RESET}")
+            return lines
+
+        u_col  = _GREEN if total_unrealized >= 0 else _RED
+        u_sign = "+" if total_unrealized >= 0 else ""
+        stale  = f"  {_DIM}(partial — {sum(1 for p in all_positions if p.token_id not in self._mid_cache)} pos. no price yet){_RESET}" if any_missing else ""
+        lines.append(
+            f"  Unrealized P&L  : {u_col}{_BOLD}${u_sign}{total_unrealized:.4f}{_RESET} USDC"
+            f"  across {len(per_pos)} position(s){stale}"
+        )
+
+        # Per-position breakdown (collapsed to keep the display tidy)
+        for label, cost, upnl in sorted(per_pos, key=lambda x: x[2]):
+            col  = _GREEN if upnl >= 0 else _RED
+            sign = "+" if upnl >= 0 else ""
+            pct  = upnl / cost * 100 if cost else 0.0
+            lines.append(
+                f"    {_DIM}├{_RESET} {label:<12}  "
+                f"{col}{sign}${upnl:.4f}  ({sign}{pct:.1f}%){_RESET}"
+            )
+
+        return lines
+
     def stats_report(self) -> str:
         """Return a multi-line formatted stats summary for the console."""
         uptime_secs = time.monotonic() - self._session_start
@@ -1020,6 +1081,7 @@ class OrderManager:
             f"{'─' * 60}",
             f"  Realized P&L    : {pnl_col}{_BOLD}${pnl_sign}{realized_pnl:.4f}{_RESET} USDC",
             f"  Win rate        : {wr_col}{_BOLD}{win_rate:.1f}%{_RESET}  ({len(wins)}/{len(priced)} priced trades)",
+            *self._unrealized_pnl_lines(),
         ]
 
         # Per-symbol breakdown
