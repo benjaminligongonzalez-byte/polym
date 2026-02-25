@@ -139,10 +139,13 @@ class StrategyConfig:
     # 0.50 = only stop-loss when our model thinks the bet is a coin-flip or worse.
     momentum_stop_loss_fair: float = 0.50
 
-    # Minimum seconds to hold any position before a stop-loss can fire.
-    # Prevents exiting immediately on entry-tick noise or mid-price wobble.
-    # Take-profit exits are unaffected (they only fire when price moves in our favour).
-    min_hold_secs: float = 30.0
+    # ---- Technical Analysis (TA) entry filters ----
+    # RSI thresholds computed from the Binance price buffer (14 periods at 20s intervals).
+    # Skip Up momentum entries when RSI > overbought (price already stretched high).
+    # Skip Down momentum entries when RSI < oversold (price already stretched low).
+    # Filter is bypassed when RSI is None (insufficient data — first ~5 min of session).
+    ta_rsi_overbought: float = 65.0   # skip Up momentum signal if RSI > this
+    ta_rsi_oversold:   float = 35.0   # skip Down momentum signal if RSI < this
 
     # ---- Arbitrage sub-strategy (edge layer) ----
     # Minimum fair-value edge (in probability points) before we act.

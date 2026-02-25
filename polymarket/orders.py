@@ -78,7 +78,8 @@ class OpenPosition:
     condition_id: str
     token_id: str
     bet: str            # "Up" or "Down"
-    entry_price: float  # price we paid (limit price)
+    entry_price: float  # limit price we paid = mid + slippage_tolerance
+    entry_mid: float    # raw market mid at entry (no slippage) — breakeven reference
     shares: float       # shares bought
     cost_usdc: float    # USDC spent
     question: str
@@ -144,6 +145,12 @@ class OrderManager:
         self._paper_pnl: float = 0.0
         # Pause / drain control
         self._paused: bool = False
+        # Optional reference to MomentumStrategy for TA buffer access
+        self._momentum: object | None = None
+
+    def set_momentum(self, strategy: object) -> None:
+        """Wire the MomentumStrategy so check_exits can read price buffers for TA."""
+        self._momentum = strategy
 
     # ------------------------------------------------------------------
     # Wallet balance management
@@ -397,6 +404,38 @@ class OrderManager:
                 config.STRATEGY.momentum_min_edge,
             )
             return
+        # ── TA confirmation ──────────────────────────────────────────────────
+        # Use live technical analysis to filter out momentum signals that fire
+        # in unfavourable conditions (overbought Up, oversold Down, counter-trend).
+        # Skips gracefully if the price buffer doesn't have enough data yet
+        # (first 4-5 minutes of a session) — FLAT signals don't block trades.
+        if self._momentum is not None:
+            from strategy.tech_analysis import compute_ta
+            ta = compute_ta(self._momentum.get_buffer(market.symbol))  # type: ignore[union-attr]
+            if direction == "UP":
+                if ta.rsi is not None and ta.rsi > config.STRATEGY.ta_rsi_overbought:
+                    log.debug(
+                        "MOMENTUM TA: %s UP RSI=%.0f > %.0f (overbought) — skip",
+                        market.symbol, ta.rsi, config.STRATEGY.ta_rsi_overbought,
+                    )
+                    return
+                if ta.trend == "DOWN":
+                    log.debug(
+                        "MOMENTUM TA: %s UP but trend=DOWN — skip", market.symbol,
+                    )
+                    return
+            else:  # direction == "DOWN"
+                if ta.rsi is not None and ta.rsi < config.STRATEGY.ta_rsi_oversold:
+                    log.debug(
+                        "MOMENTUM TA: %s DOWN RSI=%.0f < %.0f (oversold) — skip",
+                        market.symbol, ta.rsi, config.STRATEGY.ta_rsi_oversold,
+                    )
+                    return
+                if ta.trend == "UP":
+                    log.debug(
+                        "MOMENTUM TA: %s DOWN but trend=UP — skip", market.symbol,
+                    )
+                    return
         # ────────────────────────────────────────────────────────────────────
 
         order_usdc = min(self._max_order_usdc, self._remaining_budget(market.symbol))
@@ -539,22 +578,29 @@ class OrderManager:
             # Per-strategy stop-loss threshold:
             #   MOMENTUM entered at market price (~0.50-0.55) — use a looser gate.
             #   ARB/SNIPE entered only because fair ≥ 0.65 — apply the tighter gate.
-            pos_age = time.monotonic() - pos.entered_at
-            is_momentum = pos.source.startswith("MOMENTUM")
+            is_momentum = pos.source == "MOMENTUM"
             stop_loss_threshold = (
                 config.STRATEGY.momentum_stop_loss_fair
                 if is_momentum
                 else config.STRATEGY.arb_min_fair_prob
             )
 
-            # Guard: hold through temporary dips when model still has conviction.
-            # Check net sell price (mid minus slippage) vs entry to avoid
-            # crystallising a loss via slippage on a near-breakeven exit.
-            # Exception: allow exit when conviction is gone (stop-loss path).
-            effective_sell = current_mid - config.RISK.slippage_tolerance
-            if effective_sell <= pos.entry_price:
+            # Guard: hold through temporary dips.
+            #
+            # CRITICAL BUG FIX: entry_price = mid_at_entry + slippage, so comparing
+            # (current_mid - slip) <= entry_price is ALWAYS true immediately after entry
+            # (since mid hasn't moved yet).  This caused every trade to show 0s held.
+            #
+            # Fix: compare current_mid to pos.entry_mid (the raw mid with NO slippage).
+            # The guard only fires when the market has genuinely moved against us.
+            if current_mid >= pos.entry_mid:
+                # Price is at or above our entry midpoint — no loss to protect against.
+                # Fall through to take-profit triggers only; stop-loss does not apply.
+                pass
+            else:
+                # Price has fallen below our entry midpoint — check conviction.
                 if current_fair is None or current_fair >= stop_loss_threshold:
-                    continue  # still believe in trade — hold through the dip
+                    continue  # model still confident — hold through the dip
                 # conviction gone → fall through to stop-loss trigger
 
             # ---- Trigger 1: fair-value alignment (profit capture) ----
@@ -569,21 +615,36 @@ class OrderManager:
                         f"residual={residual:.3f}"
                     )
 
-            # ---- Trigger 1b: stop-loss (conviction lost) ----
-            # Exit even at a loss when our model's fair probability for the bet
-            # has dropped below the strategy-appropriate conviction threshold.
-            # Guarded by min_hold_secs: don't stop-loss on entry-tick noise.
+            # ---- Trigger 1b: stop-loss (conviction lost + TA confirmation) ----
+            # Exit at a loss only when the model's fair probability has dropped
+            # below the threshold AND live TA confirms the trade has turned against us.
+            # This prevents paper-hands exits on momentary mid-price wobbles where
+            # the underlying crypto price is still moving in our favor.
             if not should_exit and current_fair is not None:
-                if pos_age < config.STRATEGY.min_hold_secs:
-                    pass  # too young — wait for min_hold_secs before stop-loss fires
-                elif current_fair < stop_loss_threshold:
-                    should_exit = True
-                    strat_label = "momentum" if is_momentum else "arb"
-                    exit_reason = (
-                        f"stop-loss fair={current_fair:.3f} < "
-                        f"{strat_label}_thresh={stop_loss_threshold:.2f} "
-                        f"(held={pos_age:.0f}s)"
+                if current_fair < stop_loss_threshold:
+                    from strategy.tech_analysis import compute_ta
+                    ta = (
+                        compute_ta(self._momentum.get_buffer(pos.symbol))  # type: ignore[union-attr]
+                        if self._momentum is not None
+                        else None
                     )
+                    ta_supports = (
+                        (ta.supports_up() if pos.bet == "Up" else ta.supports_down())
+                        if ta is not None
+                        else False
+                    )
+                    # Exit immediately when conviction is very low (no TA rescue)
+                    conviction_very_low = current_fair < stop_loss_threshold * 0.75
+                    if conviction_very_low or not ta_supports:
+                        strat_label = "momentum" if is_momentum else "arb"
+                        ta_desc = ta.describe() if ta is not None else "no-ta"
+                        should_exit = True
+                        pos_age = time.monotonic() - pos.entered_at
+                        exit_reason = (
+                            f"stop-loss fair={current_fair:.3f} < "
+                            f"{strat_label}_thresh={stop_loss_threshold:.2f} "
+                            f"{ta_desc} held={pos_age:.0f}s"
+                        )
 
             # ---- Trigger 2: flat take-profit fallback ----
             if not should_exit and config.STRATEGY.exit_take_profit > 0.0:
@@ -718,6 +779,7 @@ class OrderManager:
                 token_id=token_id,
                 bet=token_label,
                 entry_price=limit_price,
+                entry_mid=mid,          # raw mid at entry, no slippage
                 shares=shares,
                 cost_usdc=order_usdc,
                 question=question,

@@ -157,6 +157,9 @@ class Bot:
                 on_signal=self._order_manager.execute_signal
             )
             self._aggregator.add_subscriber(self._momentum.on_tick)
+            # Give OrderManager access to price buffers so check_exits can
+            # compute TA signals for hold/exit conviction decisions.
+            self._order_manager.set_momentum(self._momentum)
 
         if self._use_arb:
             self._arb = ArbStrategy(

@@ -46,10 +46,9 @@ class MomentumStrategy:
 
     def get_buffer(self, symbol: str) -> PriceBuffer:
         if symbol not in self._buffers:
-            # Keep 2× the lookback window for safety
-            self._buffers[symbol] = PriceBuffer(
-                max_age_secs=self._cfg.lookback_secs * 2
-            )
+            # Keep 300 seconds (5 min) for TA indicators (RSI needs ~280s of history).
+            # The momentum lookback (default 5s) is a tiny subset of this window.
+            self._buffers[symbol] = PriceBuffer(max_age_secs=300.0)
         return self._buffers[symbol]
 
     async def on_tick(self, symbol: str, price: float, ts: float) -> None:

@@ -166,3 +166,7 @@ class PriceBuffer:
     @property
     def latest_ts(self) -> float | None:
         return self._data[-1][0] if self._data else None
+
+    def prices_list(self) -> list[float]:
+        """Return all buffered prices, oldest first."""
+        return [price for _, price in self._data]
