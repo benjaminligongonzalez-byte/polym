@@ -130,6 +130,8 @@ class OrderManager:
         self._closed_trades: list[ClosedTrade] = []
         self._orders_placed: int = 0      # total orders sent (momentum + arb)
         self._session_start: float = time.monotonic()
+        # Pause / drain control
+        self._paused: bool = False
 
     # ------------------------------------------------------------------
     # Wallet balance management
@@ -149,14 +151,18 @@ class OrderManager:
         self._wallet_balance = balance
         now = time.monotonic()
         if changed or now - self._last_balance_log > 300:
+            base_cap  = self._wallet_balance * config.RISK.per_symbol_base_fraction
+            surge_cap = self._wallet_balance * config.RISK.per_symbol_surge_fraction
             log.info(
                 "Wallet balance: $%.2f USDC  |  deployed: $%.2f  |  "
-                "available: $%.2f  |  max_order: $%.2f  |  per_symbol_cap: $%.2f",
+                "available: $%.2f  |  max_order: $%.2f  |  "
+                "sym_cap: $%.0f–$%.0f (conviction-scaled)%s",
                 self._wallet_balance,
                 self.total_exposure,
                 self._available_balance,
                 self._max_order_usdc,
-                self._max_per_symbol_usdc(),
+                base_cap, surge_cap,
+                "  [PAUSED]" if self._paused else "",
             )
             self._last_balance_log = now
 
@@ -180,8 +186,36 @@ class OrderManager:
         """Global safety ceiling (high; real throttle is per-symbol)."""
         return self._wallet_balance * config.RISK.max_exposure_fraction
 
-    def _max_per_symbol_usdc(self) -> float:
-        return self._wallet_balance * config.RISK.max_per_symbol_fraction
+    @staticmethod
+    def _conviction_score(edge: float, fair_prob: float) -> float:
+        """
+        Map (edge, fair_prob) → [0.0, 1.0] conviction score.
+
+        Conviction is the average of two independent subscores:
+          edge_conv  = min(1, edge / conviction_edge_scale)
+          prob_conv  = (fair_prob - prob_floor) / (prob_ceil - prob_floor), clipped
+
+        0.0 → weak/unscored (momentum default)
+        1.0 → near-certain (strong snipe)
+        """
+        cfg = config.RISK
+        edge_conv = min(1.0, edge / cfg.conviction_edge_scale) if cfg.conviction_edge_scale > 0 else 0.0
+        prob_range = cfg.conviction_prob_ceil - cfg.conviction_prob_floor
+        prob_conv  = max(0.0, min(1.0, (fair_prob - cfg.conviction_prob_floor) / prob_range)) if prob_range > 0 else 0.0
+        return (edge_conv + prob_conv) / 2.0
+
+    def _dynamic_sym_cap(self, edge: float = 0.0, fair_prob: float = 0.5) -> float:
+        """
+        Per-symbol USDC cap, scaled by conviction.
+
+        Weak signal  (conviction=0.0): per_symbol_base_fraction  × wallet
+        Near-certain (conviction=1.0): per_symbol_surge_fraction × wallet
+        """
+        conviction = self._conviction_score(edge, fair_prob)
+        base  = config.RISK.per_symbol_base_fraction
+        surge = config.RISK.per_symbol_surge_fraction
+        fraction = base + (surge - base) * conviction
+        return self._wallet_balance * fraction
 
     def _symbol_exposure(self, symbol: str) -> float:
         """Total USDC currently deployed in open positions for one symbol."""
@@ -196,17 +230,20 @@ class OrderManager:
             config.RISK.max_order_usdc_hard,
         )
 
-    def _remaining_budget(self, symbol: str = "") -> float:
+    def _remaining_budget(
+        self, symbol: str = "", edge: float = 0.0, fair_prob: float = 0.5
+    ) -> float:
         """
         Available budget for the next order.
 
         Constrained by:
-          1. Per-symbol cap  (primary throttle — prevents concentration risk)
-          2. Global cap      (safety net for extreme edge cases)
+          1. Per-symbol dynamic cap  (primary, scales with edge + fair_prob)
+          2. Global safety cap       (backstop for extreme edge cases)
         """
         global_room = max(0.0, self._max_exposure_usdc - self.total_exposure)
         if symbol:
-            sym_room = max(0.0, self._max_per_symbol_usdc() - self._symbol_exposure(symbol))
+            sym_cap  = self._dynamic_sym_cap(edge, fair_prob)
+            sym_room = max(0.0, sym_cap - self._symbol_exposure(symbol))
             return min(global_room, sym_room)
         return global_room
 
@@ -228,18 +265,21 @@ class OrderManager:
         )
         return count >= config.STRATEGY.max_open_positions
 
-    def _risk_ok(self, symbol: str) -> bool:
+    def _risk_ok(self, symbol: str, edge: float = 0.0, fair_prob: float = 0.5) -> bool:
+        if self._paused:
+            log.debug("Bot is paused — skipping new order for %s.", symbol)
+            return False
         if self._wallet_balance < config.RISK.min_order_usdc:
             log.warning("Wallet balance $%.2f too low to trade.", self._wallet_balance)
             return False
-        # Per-symbol cap: don't over-concentrate in one asset
+        # Per-symbol dynamic cap
         sym_exp = self._symbol_exposure(symbol)
-        sym_cap = self._max_per_symbol_usdc()
+        sym_cap = self._dynamic_sym_cap(edge, fair_prob)
+        conviction = self._conviction_score(edge, fair_prob)
         if sym_exp >= sym_cap:
             log.warning(
-                "%s exposure cap reached: $%.2f / $%.2f (%.0f%% of wallet per symbol)",
-                symbol, sym_exp, sym_cap,
-                config.RISK.max_per_symbol_fraction * 100,
+                "%s per-symbol cap reached: $%.2f / $%.2f  (conviction=%.2f)",
+                symbol, sym_exp, sym_cap, conviction,
             )
             return False
         # Global safety net
@@ -336,7 +376,7 @@ class OrderManager:
             log.debug("Market %s already has an open position.", cid[:8])
             return
 
-        if not self._risk_ok(sig.symbol):
+        if not self._risk_ok(sig.symbol, edge=sig.edge, fair_prob=sig.fair_prob):
             return
 
         kelly_mult = (
@@ -347,7 +387,11 @@ class OrderManager:
         kelly_usdc = sig.kelly_f * kelly_mult * self._wallet_balance
         order_usdc = max(
             config.RISK.min_order_usdc,
-            min(kelly_usdc, self._max_order_usdc, self._remaining_budget(sig.symbol)),
+            min(
+                kelly_usdc,
+                self._max_order_usdc,
+                self._remaining_budget(sig.symbol, edge=sig.edge, fair_prob=sig.fair_prob),
+            ),
         )
         if order_usdc < config.RISK.min_order_usdc:
             return
@@ -622,6 +666,28 @@ class OrderManager:
             ))
 
     # ------------------------------------------------------------------
+    # Pause / drain control
+    # ------------------------------------------------------------------
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    def pause(self) -> None:
+        """Stop accepting new BUY orders. Existing positions keep running."""
+        self._paused = True
+        log.info(
+            "Bot PAUSED — no new orders will be placed.  "
+            "Open positions: %d  |  deployed: $%.2f",
+            len(self._positions), self.total_exposure,
+        )
+
+    def resume(self) -> None:
+        """Resume accepting new BUY orders."""
+        self._paused = False
+        log.info("Bot RESUMED — new orders enabled.")
+
+    # ------------------------------------------------------------------
     # Live stats / console reporting
     # ------------------------------------------------------------------
 
@@ -644,13 +710,19 @@ class OrderManager:
         # so show cost basis only)
         deployed = self.total_exposure
 
+        base_cap  = self._wallet_balance * config.RISK.per_symbol_base_fraction
+        surge_cap = self._wallet_balance * config.RISK.per_symbol_surge_fraction
+        status = "⏸  PAUSED  (no new orders)" if self._paused else "▶  RUNNING"
+
         lines = [
             "═" * 60,
-            f"  POLYMARKET BOT  —  uptime {h:02d}h {m:02d}m {s:02d}s",
+            f"  POLYMARKET BOT  —  uptime {h:02d}h {m:02d}m {s:02d}s  |  {status}",
             "─" * 60,
             f"  Wallet balance  : ${self._wallet_balance:>10.4f} USDC",
             f"  Deployed        : ${deployed:>10.4f} USDC  ({deployed / self._wallet_balance * 100:.1f}%)" if self._wallet_balance else f"  Deployed        : ${deployed:>10.4f} USDC",
             f"  Available       : ${self._wallet_balance - deployed:>10.4f} USDC",
+            f"  Sym cap (base)  : ${base_cap:>10.2f}   (conviction=0.0 / momentum)",
+            f"  Sym cap (surge) : ${surge_cap:>10.2f}   (conviction=1.0 / near-certain snipe)",
             "─" * 60,
             f"  Orders placed   : {self._orders_placed}",
             f"  Open positions  : {len(self._positions)}",
@@ -683,21 +755,42 @@ class OrderManager:
     def positions_report(self) -> str:
         """Return details of all currently open positions."""
         if not self._positions:
-            return "  No open positions."
+            return "  No open positions currently open."
 
         now = time.monotonic()
+        total_cost = sum(p.cost_usdc for p in self._positions.values())
         lines = [
-            "─" * 60,
-            f"  Open positions ({len(self._positions)}):",
-            "─" * 60,
+            "═" * 60,
+            f"  OPEN POSITIONS  ({len(self._positions)} bets  /  ${total_cost:.2f} at risk)",
+            "═" * 60,
         ]
-        for pos in self._positions.values():
+        for i, pos in enumerate(self._positions.values(), 1):
             age_s = int(now - pos.entered_at)
+            age_m, age_s2 = divmod(age_s, 60)
+            # Look up remaining market time from cache if available
+            market = self._cache.get_market(pos.condition_id)
+            t_rem = market.time_remaining_secs if market else None
+            if t_rem is not None and t_rem > 0:
+                tr_m, tr_s = divmod(int(t_rem), 60)
+                t_rem_str = f"{tr_m}m{tr_s:02d}s left"
+            elif t_rem is not None:
+                t_rem_str = "EXPIRED"
+            else:
+                t_rem_str = "t_rem unknown"
+
             lines.append(
-                f"  [{pos.source}] {pos.symbol} {pos.bet:4}  "
-                f"entry=${pos.entry_price:.4f}  shares={pos.shares:.2f}  "
-                f"cost=${pos.cost_usdc:.2f}  age={age_s}s"
+                f"  [{i}] {pos.symbol} {pos.bet.upper():<4}  "
+                f"strategy={pos.source:<9}  "
+                f"entry=${pos.entry_price:.4f}  "
+                f"shares={pos.shares:.2f}  cost=${pos.cost_usdc:.2f}"
             )
-            lines.append(f"    {pos.question[:55]}")
-        lines.append("─" * 60)
+            lines.append(
+                f"       age={age_m}m{age_s2:02d}s  {t_rem_str}  "
+                f"cid={pos.condition_id[:10]}…"
+            )
+            lines.append(f"       {pos.question}")
+            if i < len(self._positions):
+                lines.append("  " + "·" * 56)
+
+        lines.append("═" * 60)
         return "\n".join(lines)

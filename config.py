@@ -226,16 +226,34 @@ class RiskConfig:
     # e.g. 0.05 = never bet more than 5% of your wallet on one trade.
     max_order_fraction: float = 0.05
 
-    # Maximum USDC deployed in a SINGLE SYMBOL's open positions at once,
-    # as a fraction of wallet balance.
-    # e.g. 0.25 = never have more than 25% of wallet in BTC bets simultaneously.
-    # With 4 symbols (BTC/ETH/XRP/SOL) this lets the full wallet be deployed
-    # across different assets without locking out new opportunities.
-    max_per_symbol_fraction: float = 0.25
+    # Per-symbol exposure cap — scales dynamically with signal conviction.
+    #
+    # conviction_score = f(edge, fair_prob) → 0.0 (weak) … 1.0 (near-certain)
+    #
+    # Dynamic cap = base + (surge - base) × conviction_score
+    #
+    # Weak / unscored signals (momentum default):  cap = per_symbol_base_fraction
+    # Near-certain snipes (edge≥scale, prob≥ceil):  cap = per_symbol_surge_fraction
+    #
+    # Example with $1 000 wallet:
+    #   Momentum  conviction=0.0  → cap $150  (15%)
+    #   Arb       conviction=0.5  → cap $325  (32.5%)
+    #   Snipe     conviction=1.0  → cap $500  (50%)
+    per_symbol_base_fraction: float = 0.15   # floor  (weak / momentum signals)
+    per_symbol_surge_fraction: float = 0.50  # ceiling (near-certain snipes)
+
+    # Edge value (probability points) that maps to 100% edge-conviction.
+    # Anything ≥ this is treated as full edge conviction.
+    conviction_edge_scale: float = 0.12   # 12¢ edge → full edge conviction
+
+    # Fair-probability range for conviction scoring.
+    # Below floor → 0% prob-conviction; above ceil → 100% prob-conviction.
+    conviction_prob_floor: float = 0.65
+    conviction_prob_ceil: float = 0.90
 
     # Global safety ceiling: total deployed across ALL symbols.
     # Set high (default 0.95) so it only catches runaway edge cases.
-    # The real throttle is max_per_symbol_fraction above.
+    # The real throttle is the per-symbol dynamic cap above.
     max_exposure_fraction: float = 0.95
 
     # Hard ceiling on a single order regardless of wallet size.

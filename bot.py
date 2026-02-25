@@ -217,11 +217,14 @@ class Bot:
 
     _CONSOLE_HELP = """\
 Commands (type and press Enter):
-  s  /  status     — full stats: balance, P&L, win rate, trade counts
-  p  /  positions  — open positions detail
-  m  /  markets    — active markets in cache
+  s  /  status     — full dashboard: balance, P&L, win rate, trade counts
+  p  /  positions  — open positions (symbol, direction, entry price, age)
+  m  /  markets    — active markets in cache with time remaining
+  pause            — stop new orders; let existing positions settle naturally
+  resume           — resume trading after a pause
+  drain            — pause + auto-shutdown once all open positions close
   h  /  help       — this message
-  q  /  quit       — graceful shutdown
+  q  /  quit       — immediate graceful shutdown (Ctrl+C equivalent)
 """
 
     async def _console_loop(self) -> None:
@@ -275,6 +278,46 @@ Commands (type and press Enter):
                 else:
                     print("  No markets in cache.", flush=True)
 
+            elif cmd == "pause":
+                if om:
+                    om.pause()
+                    print(
+                        f"  Paused. {len(om._positions)} position(s) still open — "
+                        "they will settle normally. Type 'resume' to restart trading, "
+                        "or 'drain' to auto-shutdown when all positions close.",
+                        flush=True,
+                    )
+                else:
+                    print("  OrderManager not ready yet.", flush=True)
+
+            elif cmd == "resume":
+                if om:
+                    om.resume()
+                    print("  Resumed. New orders are enabled.", flush=True)
+                else:
+                    print("  OrderManager not ready yet.", flush=True)
+
+            elif cmd == "drain":
+                if om:
+                    om.pause()
+                    n = len(om._positions)
+                    if n == 0:
+                        print(
+                            "  No open positions — shutting down now.",
+                            flush=True,
+                        )
+                        loop.create_task(self.stop())
+                        break
+                    print(
+                        f"  DRAIN MODE: {n} position(s) open. "
+                        "No new orders. Will auto-shutdown when all settle.",
+                        flush=True,
+                    )
+                    loop.create_task(self._drain_loop())
+                    break   # stop reading stdin — drain task will finish the job
+                else:
+                    print("  OrderManager not ready yet.", flush=True)
+
             elif cmd in ("h", "help"):
                 print(self._CONSOLE_HELP, flush=True)
 
@@ -288,6 +331,34 @@ Commands (type and press Enter):
                     f"  Unknown command '{cmd}'. Type 'h' for help.",
                     flush=True,
                 )
+
+    async def _drain_loop(self) -> None:
+        """
+        Drain mode: no new orders (already paused). Poll every 10 s.
+        When all open positions have closed (via exit or resolution),
+        trigger a graceful shutdown automatically.
+        """
+        check_interval = 10  # seconds between position checks
+        while True:
+            om = self._order_manager
+            if om is None or len(om._positions) == 0:
+                remaining = len(om._positions) if om else 0
+                print(
+                    f"\n  [drain] All positions settled ({remaining} open). "
+                    "Shutting down…\n",
+                    flush=True,
+                )
+                asyncio.get_running_loop().create_task(self.stop())
+                break
+            open_syms = ", ".join(
+                f"{p.symbol}/{p.bet}" for p in om._positions.values()
+            )
+            print(
+                f"  [drain] {len(om._positions)} position(s) still open: {open_syms}. "
+                f"Checking again in {check_interval}s…",
+                flush=True,
+            )
+            await asyncio.sleep(check_interval)
 
 
 # ---------------------------------------------------------------------------
