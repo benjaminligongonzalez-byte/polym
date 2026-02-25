@@ -697,6 +697,21 @@ class OrderManager:
             )
             if resp is not None:
                 self._blind_positions.remove(pos)
+                self._closed_trades.append(ClosedTrade(
+                    condition_id=pos.condition_id,
+                    symbol=pos.symbol,
+                    bet=pos.bet,
+                    question=pos.question,
+                    entry_price=pos.entry_price,
+                    exit_price=sell_price,
+                    shares=pos.shares,
+                    cost_usdc=pos.cost_usdc,
+                    pnl_usdc=pnl,
+                    source="BLIND-COPY",
+                    close_type="blind-sell",
+                    opened_at=pos.entered_at,
+                    closed_at=time.monotonic(),
+                ))
 
         remaining = len([p for p in self._blind_positions if p.token_id == token_id])
         sold = len(matching) - remaining

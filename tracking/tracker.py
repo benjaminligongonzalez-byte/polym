@@ -229,13 +229,16 @@ class TraderTracker:
         try:
             result = await self._fetch_clob_api()
             if result:
+                log.debug("Tracker: CLOB API returned %d trades", len(result))
                 return result
+            log.debug("Tracker: CLOB API returned 0 trades — falling back to Data API")
         except Exception as exc:
             log.debug("Tracker: CLOB API error (%s) — trying Data API", exc)
 
         try:
             result = await self._fetch_data_api()
             if result is not None:
+                log.debug("Tracker: Data API returned %d trades (CLOB was empty)", len(result))
                 return result
         except Exception as exc:
             log.debug("Tracker: Data API also failed: %s", exc)
@@ -273,32 +276,40 @@ class TraderTracker:
 
     async def _fetch_clob_api(self) -> list[dict]:
         """
-        GET clob.polymarket.com/trades?maker_address=ADDR  (our fills as maker)
-        GET clob.polymarket.com/trades?taker_address=ADDR  (our fills as taker)
+        GET clob.polymarket.com/trades?maker_address=ADDR  (fills as maker)
+        GET clob.polymarket.com/trades?taker_address=ADDR  (fills as taker)
 
-        Merges both result sets and deduplicates by trade ID / tx hash.
+        Both requests fire concurrently to halve round-trip time.
+        Results are merged and deduplicated by trade ID.
         """
         assert self._session is not None
-        url     = f"{config.CLOB_HOST}/trades"
-        merged: list[dict] = []
-        seen:   set[str]   = set()
+        url = f"{config.CLOB_HOST}/trades"
 
-        for role_param in ("maker_address", "taker_address"):
-            params = {role_param: self._address, "limit": 100}
+        async def _fetch_role(role_param: str) -> list[dict]:
             try:
+                params = {role_param: self._address, "limit": 100}
                 async with self._session.get(url, params=params) as resp:
                     if resp.status != 200:
-                        continue
+                        return []
                     body = await resp.json(content_type=None)
                     trades = body.get("data", body) if isinstance(body, dict) else body
-                    for t in (trades or []):
-                        tid = self._trade_id(t)
-                        if tid and tid not in seen:
-                            seen.add(tid)
-                            merged.append(t)
+                    return trades or []
             except Exception as exc:
                 log.debug("Tracker: CLOB %s query failed: %s", role_param, exc)
+                return []
 
+        maker_trades, taker_trades = await asyncio.gather(
+            _fetch_role("maker_address"),
+            _fetch_role("taker_address"),
+        )
+
+        merged: list[dict] = []
+        seen:   set[str]   = set()
+        for t in maker_trades + taker_trades:
+            tid = self._trade_id(t)
+            if tid and tid not in seen:
+                seen.add(tid)
+                merged.append(t)
         return merged
 
     # ------------------------------------------------------------------
