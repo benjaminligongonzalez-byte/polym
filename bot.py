@@ -74,6 +74,7 @@ from polymarket.markets import MarketCache
 from polymarket.orders import OrderManager
 from strategy.momentum import MomentumStrategy
 from strategy.arbitrage import ArbStrategy
+from feeds.polymarket_ws import ClobFeed
 from tracking.tracker import TraderTracker
 
 
@@ -116,6 +117,7 @@ class Bot:
         self._tasks: list[asyncio.Task] = []
         self._drain_task: asyncio.Task | None = None
         self._tracker: TraderTracker | None = None
+        self._clob_feed: ClobFeed | None = None
 
     async def start(self) -> None:
         log.info("=== Polymarket Trading Bot starting ===")
@@ -174,9 +176,15 @@ class Bot:
             self._arb.set_order_manager(self._order_manager)
             # Subscribe to price ticks so the arb strategy re-evaluates markets
             # immediately on every incoming Binance/Coinbase trade event, rather
-            # than waiting for the next polling interval.  Midpoints are cached
-            # inside ArbStrategy so no extra CLOB API calls are made per tick.
+            # than waiting for the next polling interval.
             self._aggregator.add_subscriber(self._arb.on_price_tick)
+
+            # Live Polymarket CLOB WebSocket feed — replaces HTTP midpoint
+            # polling (1.5 s TTL) with push events from Polymarket's own WS.
+            # When the CLOB price changes, on_clob_tick fires immediately so we
+            # evaluate edge in <100 ms vs waiting up to 1.5 s for next poll.
+            self._clob_feed = ClobFeed(on_update=self._arb.on_clob_tick)
+            self._arb.set_clob_feed(self._clob_feed)
 
         # 5. Wire feeds → aggregator
         binance_cb = make_feed_callback(self._aggregator, "binance")
@@ -203,6 +211,16 @@ class Bot:
         if self._use_arb and self._arb:
             self._tasks.append(
                 asyncio.create_task(self._arb.run(), name="arb-scanner")
+            )
+        if self._clob_feed:
+            # Subscribe to any markets already in cache on startup
+            self._clob_feed.update_subscriptions(self._clob_token_ids())
+            self._tasks.append(
+                asyncio.create_task(self._clob_feed.run(), name="clob-feed")
+            )
+            # Refresh subscriptions as new 15-min windows open
+            self._tasks.append(
+                asyncio.create_task(self._clob_refresh_loop(), name="clob-refresh")
             )
 
         # Optional: live trade tracker for a target Polymarket wallet
@@ -256,6 +274,28 @@ class Bot:
 
     # ------------------------------------------------------------------
     # ------------------------------------------------------------------
+    # CLOB WebSocket helpers
+    # ------------------------------------------------------------------
+
+    def _clob_token_ids(self) -> list[str]:
+        """Return Up-token IDs for all active markets (for WS subscription)."""
+        return [m.up_token.token_id for m in self._market_cache.all_markets()]
+
+    async def _clob_refresh_loop(self) -> None:
+        """
+        Every 20 s re-read the market cache and update CLOB subscriptions.
+
+        New 15-min windows open every 15 min; this loop ensures the CLOB feed
+        subscribes to their tokens within 20 s of the window appearing.
+        """
+        while True:
+            await asyncio.sleep(20.0)
+            if self._clob_feed:
+                tids = self._clob_token_ids()
+                if tids:
+                    self._clob_feed.update_subscriptions(tids)
+
+    # ------------------------------------------------------------------
     # Copy-trade callback
     # ------------------------------------------------------------------
 
@@ -272,7 +312,7 @@ class Bot:
         if trade.side != "BUY":
             return  # don't copy sells
         om = self._order_manager
-        if om is None or om.paused:
+        if om is None or om.is_paused():
             return
         sym       = trade.symbol
         direction = trade.direction

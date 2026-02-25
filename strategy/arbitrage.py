@@ -147,6 +147,8 @@ class ArbStrategy:
         # condition_id → monotonic timestamp of last emitted signal
         self._last_signal: dict[str, float] = {}
         self._order_manager: Any = None
+        # Live CLOB WebSocket feed (set via set_clob_feed); None = use HTTP polling
+        self._clob_feed: Any = None
         # Polymarket midpoint cache: token_id → (mid_price, monotonic_timestamp)
         # Prevents hammering the CLOB API when price ticks arrive at sub-second rates.
         # Cache entries are reused for up to config.STRATEGY.midpoint_cache_ttl seconds.
@@ -155,6 +157,29 @@ class ArbStrategy:
     def set_order_manager(self, order_manager: Any) -> None:
         """Wire in the OrderManager so we can trigger exit scans."""
         self._order_manager = order_manager
+
+    def set_clob_feed(self, feed: Any) -> None:
+        """
+        Wire in the live ClobFeed (feeds/polymarket_ws.py).
+
+        When set, _evaluate() reads Polymarket prices from the WebSocket
+        cache (sub-100 ms) instead of HTTP polling (1.5 s TTL).
+        """
+        self._clob_feed = feed
+
+    async def on_clob_tick(self, token_id: str, mid: float) -> None:
+        """
+        Called by ClobFeed on every Polymarket CLOB price change event.
+
+        Finds the market that owns this Up-token and immediately re-evaluates
+        edge — no wait for the next polling cycle.  This is the core of real-
+        time arbitrage: we react to Polymarket price changes in <100 ms, the
+        same way we react to Binance/Coinbase price ticks.
+        """
+        for market in self._cache.all_markets():
+            if market.up_token.token_id == token_id:
+                await self._evaluate(market)
+                return
 
     async def run(self) -> None:
         """
@@ -230,22 +255,42 @@ class ArbStrategy:
             else config.STRATEGY.arb_edge_threshold
         )
 
-        # --- 4. Fetch live Polymarket prices for both tokens (cache-backed) ---
-        # Re-use a cached midpoint if it is younger than midpoint_cache_ttl.
-        # This lets on_price_tick fire on every Binance/Coinbase trade event
-        # without making a CLOB API call on every single tick.
+        # --- 4. Fetch live Polymarket prices ---
+        #
+        # Priority:
+        #   A) ClobFeed WebSocket cache (sub-100 ms updates, always fresh)
+        #   B) HTTP midpoint cache (1.5 s TTL — fallback when WS unavailable)
+        #
+        # When the CLOB WebSocket is connected, we get push notifications on
+        # every price change so there is no staleness at all.  The HTTP cache
+        # is kept as a fallback for startup / reconnect periods.
         token_id = market.up_token.token_id
         _now_mono = time.monotonic()
-        cached = self._midpoint_cache.get(token_id)
-        if cached and (_now_mono - cached[1]) < config.STRATEGY.midpoint_cache_ttl:
-            up_mid = cached[0]
-        else:
-            try:
-                up_mid = await self._pm_client.get_midpoint(token_id)
-            except Exception as exc:
-                log.debug("Midpoint fetch failed for %s: %s", cid[:8], exc)
-                return
+
+        # A: try WebSocket cache first
+        ws_mid: float | None = (
+            self._clob_feed.get_mid(token_id)
+            if self._clob_feed is not None
+            else None
+        )
+
+        if ws_mid is not None:
+            up_mid = ws_mid
+            # Keep HTTP cache warm so fallback has a recent value
             self._midpoint_cache[token_id] = (up_mid, _now_mono)
+        else:
+            # B: HTTP cache or fresh API call
+            cached = self._midpoint_cache.get(token_id)
+            if cached and (_now_mono - cached[1]) < config.STRATEGY.midpoint_cache_ttl:
+                up_mid = cached[0]
+            else:
+                try:
+                    up_mid = await self._pm_client.get_midpoint(token_id)
+                except Exception as exc:
+                    log.debug("Midpoint fetch failed for %s: %s", cid[:8], exc)
+                    return
+                self._midpoint_cache[token_id] = (up_mid, _now_mono)
+
         down_mid = 1.0 - up_mid   # Up + Down must sum to 1 per contract
 
         # --- 5. Fair probability ---
