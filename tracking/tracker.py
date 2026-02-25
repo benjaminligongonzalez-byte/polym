@@ -99,11 +99,12 @@ class TrackedTrade:
 class LoggedTrade:
     """Enriched record of a single observed trade, stored for strategy analysis."""
     trade:       TrackedTrade
-    detected_at: float   # unix epoch: when our bot first saw this trade
-    seq:         int     # trade number within this session (1-based)
-    pos_before:  float   # net shares in this token BEFORE this trade
-    pos_after:   float   # net shares AFTER this trade
-    trade_type:  str     # OPEN / ADD / TRIM / CLOSE / FLIP / SHORT / ADD_S / COVER
+    detected_at: float         # unix epoch: when our bot first saw this trade
+    seq:         int           # trade number within this session (1-based)
+    pos_before:  float         # net shares in this token BEFORE this trade
+    pos_after:   float         # net shares AFTER this trade
+    trade_type:  str           # OPEN / ADD / TRIM / CLOSE / FLIP / SHORT / ADD_S / COVER
+    spot_price:  float | None  # consensus crypto spot price at detection time (USD)
 
     @property
     def lag(self) -> float:
@@ -145,10 +146,12 @@ class TraderTracker:
     def __init__(
         self,
         address: str,
-        on_trade: Callable[[TrackedTrade], Awaitable[None]] | None = None,
+        on_trade:   Callable[[TrackedTrade], Awaitable[None]] | None = None,
+        price_feed: Callable[[str], float | None] | None = None,
     ) -> None:
-        self._address   = address.lower()
-        self._on_trade  = on_trade
+        self._address    = address.lower()
+        self._on_trade   = on_trade
+        self._price_feed = price_feed  # consensus_price(symbol) → spot USD price
         self._session: aiohttp.ClientSession | None = None
 
         # Deduplication: trade IDs / tx hashes we've already processed
@@ -586,9 +589,10 @@ class TraderTracker:
     def _log_trade(self, trade: TrackedTrade) -> None:
         # ── Strategy-analysis record ──────────────────────────────────────────
         key        = trade.token_id or trade.condition_id
-        pos_before = self._net_shares.get(key, 0.0)
-        delta      = trade.size if trade.side == "BUY" else -trade.size
-        pos_after  = pos_before + delta
+        pos_before  = self._net_shares.get(key, 0.0)
+        delta       = trade.size if trade.side == "BUY" else -trade.size
+        pos_after   = pos_before + delta
+        spot        = self._price_feed(trade.symbol) if self._price_feed and trade.symbol else None
         self._session_seq += 1
         self._logged_trades.append(LoggedTrade(
             trade       = trade,
@@ -597,6 +601,7 @@ class TraderTracker:
             pos_before  = pos_before,
             pos_after   = pos_after,
             trade_type  = LoggedTrade._infer_type(trade.side, pos_before, pos_after),
+            spot_price  = spot,
         ))
         # ─────────────────────────────────────────────────────────────────────
         side_col = _GREEN if trade.side == "BUY" else _RED
@@ -863,8 +868,8 @@ class TraderTracker:
         else:
             hdr = (
                 f"  {'#':>4}  {'TIME':8}  {'LAG':>5}  {'TYPE':5}  {'SIDE':4}  "
-                f"{'DIR':4}  {'PRICE':>6}  {'SHARES':>7}  {'USD':>7}  "
-                f"{'BEFORE':>7}  {'AFTER':>7}  MARKET"
+                f"{'DIR':4}  {'BET':>6}  {'SHARES':>7}  {'USD':>7}  "
+                f"{'BEFORE':>7}  {'AFTER':>7}  {'SPOT':>10}  MARKET"
             )
             lines += ["", hdr, "  " + sep]
 
@@ -875,10 +880,11 @@ class TraderTracker:
                 side_s = "BUY " if t.side == "BUY" else "SELL"
                 dir_s  = (t.direction or "?").ljust(4)
                 mkt    = self._shorten_market(t.question, 30)
+                spot_s = f"${lt.spot_price:,.2f}" if lt.spot_price else "     n/a"
                 lines.append(
                     f"  {lt.seq:>4}  {ts_str}  {lag_s:>4}s  {lt.trade_type:<5}  {side_s}  "
                     f"{dir_s}  {lt.price_cents:>5.1f}¢  {t.size:>7.1f}  ${t.amount:>6.2f}  "
-                    f"{lt.pos_before:>+7.1f}  {lt.pos_after:>+7.1f}  {mkt}"
+                    f"{lt.pos_before:>+7.1f}  {lt.pos_after:>+7.1f}  {spot_s:>10}  {mkt}"
                 )
 
         # ── Summary ───────────────────────────────────────────────────────────
