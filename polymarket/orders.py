@@ -130,6 +130,8 @@ class OrderManager:
         self._closed_trades: list[ClosedTrade] = []
         self._orders_placed: int = 0      # total orders sent (momentum + arb)
         self._session_start: float = time.monotonic()
+        # Paper-trade running P&L (applied to wallet balance so sizing stays accurate)
+        self._paper_pnl: float = 0.0
         # Pause / drain control
         self._paused: bool = False
 
@@ -144,7 +146,9 @@ class OrderManager:
         when the wallet holds no real USDC.
         """
         if config.PAPER_TRADE:
-            balance = config.PAPER_BALANCE_USDC
+            # Start from the configured virtual balance and apply all realized P&L
+            # so the wallet shrinks on losses and grows on wins — just like real trading.
+            balance = config.PAPER_BALANCE_USDC + self._paper_pnl
         else:
             balance = await self._client.get_usdc_balance()
         changed = abs(balance - self._wallet_balance) > 0.01
@@ -322,6 +326,15 @@ class OrderManager:
         if self._on_cooldown(cid) or cid in self._positions:
             return
 
+        # Skip markets that have expired or won't open for 15+ minutes
+        t_rem = market.time_remaining_secs
+        if t_rem <= 0:
+            log.debug("Skipping expired market %s (%s).", cid[:8], market.question[:40])
+            return
+        if t_rem > 930:
+            log.debug("Skipping far-future market %s (t_rem=%.0fs).", cid[:8], t_rem)
+            return
+
         if direction == "UP":
             token = market.up_token
             token_label = "Up"
@@ -447,6 +460,16 @@ class OrderManager:
             market = self._cache.get_market(cid)
             t_rem = market.time_remaining_secs if market else 0.0
 
+            # Market fully expired — free capital; outcome unknown until oracle settles.
+            if t_rem <= 0:
+                log.info(
+                    "Market expired: releasing %s %s/%s position  "
+                    "(cost=$%.2f — recorded as 'resolved', P&L pending oracle).",
+                    pos.symbol, pos.bet, cid[:8], pos.cost_usdc,
+                )
+                self.record_resolution(cid)
+                continue
+
             # Don't sell within exit_min_t_rem of expiry — just let it resolve
             if t_rem < config.STRATEGY.exit_min_t_rem:
                 continue
@@ -521,7 +544,7 @@ class OrderManager:
             total_profit_usdc = profit_per_share * pos.shares
             log.info(
                 "EXIT  %-3s  %s  %s  entry=%.4f  now=%.4f  "
-                "profit=%+$.2f (%.1f%%)  t_rem=%.0fs  [%s]",
+                "profit=$%+.2f (%.1f%%)  t_rem=%.0fs  [%s]",
                 pos.symbol, cid[:8], pos.bet,
                 pos.entry_price, current_mid,
                 total_profit_usdc,
@@ -555,6 +578,10 @@ class OrderManager:
 
         if resp is not None:
             pnl = round((sell_price - pos.entry_price) * pos.shares, 4)
+            # Update paper balance immediately so the next trade sizes correctly.
+            if config.PAPER_TRADE:
+                self._paper_pnl += pnl
+                self._wallet_balance = config.PAPER_BALANCE_USDC + self._paper_pnl
             self._closed_trades.append(ClosedTrade(
                 condition_id=pos.condition_id,
                 symbol=pos.symbol,
@@ -573,7 +600,7 @@ class OrderManager:
             self._positions.pop(pos.condition_id, None)
             self._last_trade[pos.condition_id] = time.monotonic()
             log.info(
-                "Position exited early.  cid=%s  pnl=%+$.4f  total_exposure=$%.2f",
+                "Position exited early.  cid=%s  pnl=$%+.4f  total_exposure=$%.2f",
                 pos.condition_id[:8], pnl, self.total_exposure,
             )
 

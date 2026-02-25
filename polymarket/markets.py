@@ -174,7 +174,7 @@ class MarketCache:
     async def refresh(self) -> None:
         log.info("Refreshing market cache from Gamma API …")
         try:
-            markets = await self._fetch_gamma_markets()
+            markets, had_errors = await self._fetch_gamma_markets()
             new_cache: dict[str, MarketInfo] = {}
             for m in markets:
                 if m.condition_id in self._markets:
@@ -185,19 +185,34 @@ class MarketCache:
                     if m.strike_price is None:
                         m.strike_price = existing.strike_price
                 new_cache[m.condition_id] = m
+
+            if len(new_cache) == 0 and had_errors and len(self._markets) > 0:
+                # Network error — all slugs failed to connect.
+                # Keep the previous cache so trading can continue on cached data.
+                log.warning(
+                    "Market refresh returned 0 results due to network errors — "
+                    "retaining %d cached market(s).",
+                    len(self._markets),
+                )
+                return
+
             self._markets = new_cache
             self._last_full_refresh = time.monotonic()
             log.info("Market cache: %d tradeable markets found.", len(self._markets))
         except Exception as exc:
             log.error("Market refresh failed: %s", exc)
 
-    async def _fetch_gamma_markets(self) -> list[MarketInfo]:
+    async def _fetch_gamma_markets(self) -> tuple[list[MarketInfo], bool]:
         """Fetch current 15-min window markets by slug.
 
         Slugs follow the pattern: {sym}-updown-15m-{epoch}
         where epoch is the unix timestamp of the 15-min window start.
         Boundaries fall at :00, :15, :30, :45 of every hour (every 900s).
         We check the current and previous boundary to cover overlap.
+
+        Returns (markets, had_connection_errors).
+        had_connection_errors=True means at least one slug failed due to network
+        issues (not 404), so a zero result may be due to an outage, not lack of markets.
         """
         now = int(time.time())
         current_boundary = (now // 900) * 900
@@ -206,6 +221,7 @@ class MarketCache:
         sym_slugs = {"BTC": "btc", "ETH": "eth", "XRP": "xrp", "SOL": "sol"}
         raw_markets: list[dict] = []
         seen_cids: set[str] = set()
+        had_errors = False
 
         for boundary in boundaries:
             for sym, slug_sym in sym_slugs.items():
@@ -229,6 +245,7 @@ class MarketCache:
                             raw_markets.append(m)
                 except Exception as exc:
                     log.warning("Slug fetch error for %s: %s", slug, exc)
+                    had_errors = True
 
         if not raw_markets:
             log.warning("Slug lookup: all slugs returned 404 — no active 15-min markets found.")
@@ -242,7 +259,7 @@ class MarketCache:
             m = self._parse_gamma_market(raw)
             if m is not None:
                 results.append(m)
-        return results
+        return results, had_errors
 
     @staticmethod
     def _parse_gamma_market(raw: dict) -> Optional[MarketInfo]:
