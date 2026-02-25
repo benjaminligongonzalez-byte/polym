@@ -151,12 +151,12 @@ class OrderManager:
         if changed or now - self._last_balance_log > 300:
             log.info(
                 "Wallet balance: $%.2f USDC  |  deployed: $%.2f  |  "
-                "available: $%.2f  |  max_order: $%.2f  |  max_exposure: $%.2f",
+                "available: $%.2f  |  max_order: $%.2f  |  per_symbol_cap: $%.2f",
                 self._wallet_balance,
                 self.total_exposure,
                 self._available_balance,
                 self._max_order_usdc,
-                self._max_exposure_usdc,
+                self._max_per_symbol_usdc(),
             )
             self._last_balance_log = now
 
@@ -177,7 +177,17 @@ class OrderManager:
 
     @property
     def _max_exposure_usdc(self) -> float:
+        """Global safety ceiling (high; real throttle is per-symbol)."""
         return self._wallet_balance * config.RISK.max_exposure_fraction
+
+    def _max_per_symbol_usdc(self) -> float:
+        return self._wallet_balance * config.RISK.max_per_symbol_fraction
+
+    def _symbol_exposure(self, symbol: str) -> float:
+        """Total USDC currently deployed in open positions for one symbol."""
+        return sum(
+            p.cost_usdc for p in self._positions.values() if p.symbol == symbol
+        )
 
     @property
     def _max_order_usdc(self) -> float:
@@ -186,8 +196,19 @@ class OrderManager:
             config.RISK.max_order_usdc_hard,
         )
 
-    def _remaining_budget(self) -> float:
-        return max(0.0, self._max_exposure_usdc - self.total_exposure)
+    def _remaining_budget(self, symbol: str = "") -> float:
+        """
+        Available budget for the next order.
+
+        Constrained by:
+          1. Per-symbol cap  (primary throttle — prevents concentration risk)
+          2. Global cap      (safety net for extreme edge cases)
+        """
+        global_room = max(0.0, self._max_exposure_usdc - self.total_exposure)
+        if symbol:
+            sym_room = max(0.0, self._max_per_symbol_usdc() - self._symbol_exposure(symbol))
+            return min(global_room, sym_room)
+        return global_room
 
     # ------------------------------------------------------------------
     # Risk helpers
@@ -211,9 +232,20 @@ class OrderManager:
         if self._wallet_balance < config.RISK.min_order_usdc:
             log.warning("Wallet balance $%.2f too low to trade.", self._wallet_balance)
             return False
+        # Per-symbol cap: don't over-concentrate in one asset
+        sym_exp = self._symbol_exposure(symbol)
+        sym_cap = self._max_per_symbol_usdc()
+        if sym_exp >= sym_cap:
+            log.warning(
+                "%s exposure cap reached: $%.2f / $%.2f (%.0f%% of wallet per symbol)",
+                symbol, sym_exp, sym_cap,
+                config.RISK.max_per_symbol_fraction * 100,
+            )
+            return False
+        # Global safety net
         if self.total_exposure >= self._max_exposure_usdc:
             log.warning(
-                "Exposure cap reached: $%.2f / $%.2f",
+                "Global exposure cap reached: $%.2f / $%.2f",
                 self.total_exposure, self._max_exposure_usdc,
             )
             return False
@@ -272,7 +304,7 @@ class OrderManager:
             log.debug("Market %s: %s mid=%.3f outside range.", cid[:8], token_label, mid)
             return
 
-        order_usdc = min(self._max_order_usdc, self._remaining_budget())
+        order_usdc = min(self._max_order_usdc, self._remaining_budget(market.symbol))
         if order_usdc < config.RISK.min_order_usdc:
             return
 
@@ -315,7 +347,7 @@ class OrderManager:
         kelly_usdc = sig.kelly_f * kelly_mult * self._wallet_balance
         order_usdc = max(
             config.RISK.min_order_usdc,
-            min(kelly_usdc, self._max_order_usdc, self._remaining_budget()),
+            min(kelly_usdc, self._max_order_usdc, self._remaining_budget(sig.symbol)),
         )
         if order_usdc < config.RISK.min_order_usdc:
             return

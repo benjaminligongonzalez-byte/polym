@@ -226,10 +226,17 @@ class RiskConfig:
     # e.g. 0.05 = never bet more than 5% of your wallet on one trade.
     max_order_fraction: float = 0.05
 
-    # Maximum total USDC deployed across all open positions at once,
+    # Maximum USDC deployed in a SINGLE SYMBOL's open positions at once,
     # as a fraction of wallet balance.
-    # e.g. 0.20 = never have more than 20% of wallet exposed simultaneously.
-    max_exposure_fraction: float = 0.20
+    # e.g. 0.25 = never have more than 25% of wallet in BTC bets simultaneously.
+    # With 4 symbols (BTC/ETH/XRP/SOL) this lets the full wallet be deployed
+    # across different assets without locking out new opportunities.
+    max_per_symbol_fraction: float = 0.25
+
+    # Global safety ceiling: total deployed across ALL symbols.
+    # Set high (default 0.95) so it only catches runaway edge cases.
+    # The real throttle is max_per_symbol_fraction above.
+    max_exposure_fraction: float = 0.95
 
     # Hard ceiling on a single order regardless of wallet size.
     # Prevents runaway bets on large wallets.
