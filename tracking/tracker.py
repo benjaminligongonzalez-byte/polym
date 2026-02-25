@@ -254,7 +254,7 @@ class TraderTracker:
         """
         assert self._session is not None
         url    = f"{config.DATA_API}/activity"
-        params = {"user": self._address, "limit": 100}
+        params = {"user": self._address, "limit": 20}  # only need recent; smaller = faster
 
         async with self._session.get(url, params=params) as resp:
             if resp.status == 404:
@@ -374,10 +374,10 @@ class TraderTracker:
 
         # ── Timestamp ────────────────────────────────────────────────────
         ts_raw = (
-            raw.get("timestamp")
-            or raw.get("matchTime")
+            raw.get("matchTime")    # actual fill/match time — most accurate
             or raw.get("block_time")
-            or raw.get("createdAt")
+            or raw.get("timestamp")
+            or raw.get("createdAt") # order creation time — least accurate, last resort
         )
         try:
             timestamp = float(ts_raw) if ts_raw else time.time()
