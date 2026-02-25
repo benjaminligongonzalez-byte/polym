@@ -141,6 +141,7 @@ class OrderManager:
         # Trade history
         self._closed_trades: list[ClosedTrade] = []
         self._orders_placed: int = 0      # total orders sent (momentum + arb)
+        self._blind_copy_count: int = 0   # blind copy orders placed
         self._session_start: float = time.monotonic()
         # Paper-trade running P&L (applied to wallet balance so sizing stays accurate)
         self._paper_pnl: float = 0.0
@@ -567,6 +568,15 @@ class OrderManager:
             )
             return
 
+        # ── Token ID guard ─────────────────────────────────────────────
+        if not trade.token_id:
+            log.warning(
+                "Blind copy: no token_id for trade %s — cannot place order. "
+                "Run --loglevel DEBUG to see raw API fields.",
+                trade.trade_id[:16],
+            )
+            return
+
         # ── Place order ────────────────────────────────────────────────
         limit_price = round(min(trade.price + config.RISK.slippage_tolerance, 0.99), 4)
         shares      = round(order_usdc / limit_price, 2)
@@ -590,10 +600,13 @@ class OrderManager:
         )
 
         if resp is not None:
-            self._orders_placed += 1
+            self._blind_copy_count += 1
             log.info(
-                "%s[BLIND-COPY]%s  order placed — %s token=%s…",
-                _MAGENTA, _RESET, trade.question[:40], trade.token_id[:12],
+                "%s[BLIND-COPY]%s  order placed — %s%s%s  token=%s  cid=%s",
+                _MAGENTA, _RESET,
+                outcome_col, trade.outcome, _RESET,
+                trade.token_id[:16] + "…",
+                trade.condition_id[:12] + "…",
             )
 
     # ------------------------------------------------------------------
@@ -977,7 +990,8 @@ class OrderManager:
             f"  {_DIM}Sym cap (base)  : ${base_cap:>10.2f}   (conviction=0.0 / momentum){_RESET}",
             f"  {_DIM}Sym cap (surge) : ${surge_cap:>10.2f}   (conviction=1.0 / near-certain snipe){_RESET}",
             f"{'─' * 60}",
-            f"  Orders placed   : {_CYAN}{self._orders_placed}{_RESET}",
+            f"  Orders placed   : {_CYAN}{self._orders_placed}{_RESET}"
+            + (f"  {_MAGENTA}(+ {self._blind_copy_count} blind copies){_RESET}" if self._blind_copy_count else ""),
             f"  Open positions  : {_CYAN}{len(self._positions)}{_RESET}",
             f"  Closed trades   : {len(self._closed_trades)}",
             f"    ├ Early exits : {len(priced)}  ({_GREEN}wins={len(wins)}{_RESET}  {_RED}losses={len(losses)}{_RESET})",

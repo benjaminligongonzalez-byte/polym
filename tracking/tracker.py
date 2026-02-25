@@ -327,8 +327,15 @@ class TraderTracker:
             or raw.get("token_id")
             or raw.get("asset_id")
             or raw.get("assetId")
+            or raw.get("asset")          # CLOB API fill format
+            or raw.get("outcome_id")
+            or raw.get("outcomeId")
             or ""
         )
+
+        # Log unknown field layout once so we can diagnose missing token_ids
+        if not token_id:
+            log.debug("Tracker: token_id not found in raw trade — keys: %s", list(raw.keys()))
 
         # ── Side ─────────────────────────────────────────────────────────
         side_raw = (raw.get("side") or raw.get("type") or "BUY").upper()
