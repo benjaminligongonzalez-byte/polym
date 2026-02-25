@@ -132,6 +132,18 @@ class StrategyConfig:
     # Example: Down at 0.895, model fair=0.494 → edge=−0.401 → blocked.
     momentum_min_edge: float = 0.0
 
+    # Stop-loss conviction threshold for MOMENTUM positions.
+    # Lower than arb_min_fair_prob (0.65) because momentum entries are made at
+    # market prices (~0.50–0.55), not because the model is already 65% confident.
+    # Exiting a profitable momentum trade just because fair=0.640 < 0.65 is wrong.
+    # 0.50 = only stop-loss when our model thinks the bet is a coin-flip or worse.
+    momentum_stop_loss_fair: float = 0.50
+
+    # Minimum seconds to hold any position before a stop-loss can fire.
+    # Prevents exiting immediately on entry-tick noise or mid-price wobble.
+    # Take-profit exits are unaffected (they only fire when price moves in our favour).
+    min_hold_secs: float = 30.0
+
     # ---- Arbitrage sub-strategy (edge layer) ----
     # Minimum fair-value edge (in probability points) before we act.
     # e.g. 0.05 = we only trade when Polymarket is >5 cents wrong.
@@ -272,8 +284,10 @@ class RiskConfig:
     min_order_usdc: float = 2.0
 
     # How far above mid-price we'll bid (aggressive taker).
-    # e.g. 0.03 = pay up to 3 cents more than current best ask.
-    slippage_tolerance: float = 0.03
+    # Reduced from 0.03 to 0.01: the old 6¢ roundtrip (buy+sell) was eating the
+    # full profit on BTC trades (94 shares × 0.06 = $5.69).  At 0.01 roundtrip
+    # cost is 2¢/share which still ensures fills while keeping friction low.
+    slippage_tolerance: float = 0.01
 
     # How often (seconds) to re-fetch the wallet USDC balance.
     balance_refresh_secs: float = 30.0

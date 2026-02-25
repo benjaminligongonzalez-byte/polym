@@ -536,13 +536,24 @@ class OrderManager:
                 p_up = fair_prob_up(consensus, pos.strike_price, t_rem, vol)
                 current_fair = p_up if pos.bet == "Up" else (1.0 - p_up)
 
+            # Per-strategy stop-loss threshold:
+            #   MOMENTUM entered at market price (~0.50-0.55) — use a looser gate.
+            #   ARB/SNIPE entered only because fair ≥ 0.65 — apply the tighter gate.
+            pos_age = time.monotonic() - pos.entered_at
+            is_momentum = pos.source.startswith("MOMENTUM")
+            stop_loss_threshold = (
+                config.STRATEGY.momentum_stop_loss_fair
+                if is_momentum
+                else config.STRATEGY.arb_min_fair_prob
+            )
+
             # Guard: hold through temporary dips when model still has conviction.
             # Check net sell price (mid minus slippage) vs entry to avoid
             # crystallising a loss via slippage on a near-breakeven exit.
             # Exception: allow exit when conviction is gone (stop-loss path).
             effective_sell = current_mid - config.RISK.slippage_tolerance
             if effective_sell <= pos.entry_price:
-                if current_fair is None or current_fair >= config.STRATEGY.arb_min_fair_prob:
+                if current_fair is None or current_fair >= stop_loss_threshold:
                     continue  # still believe in trade — hold through the dip
                 # conviction gone → fall through to stop-loss trigger
 
@@ -560,13 +571,18 @@ class OrderManager:
 
             # ---- Trigger 1b: stop-loss (conviction lost) ----
             # Exit even at a loss when our model's fair probability for the bet
-            # has dropped below the minimum entry conviction threshold.
+            # has dropped below the strategy-appropriate conviction threshold.
+            # Guarded by min_hold_secs: don't stop-loss on entry-tick noise.
             if not should_exit and current_fair is not None:
-                if current_fair < config.STRATEGY.arb_min_fair_prob:
+                if pos_age < config.STRATEGY.min_hold_secs:
+                    pass  # too young — wait for min_hold_secs before stop-loss fires
+                elif current_fair < stop_loss_threshold:
                     should_exit = True
+                    strat_label = "momentum" if is_momentum else "arb"
                     exit_reason = (
                         f"stop-loss fair={current_fair:.3f} < "
-                        f"arb_min={config.STRATEGY.arb_min_fair_prob:.2f}"
+                        f"{strat_label}_thresh={stop_loss_threshold:.2f} "
+                        f"(held={pos_age:.0f}s)"
                     )
 
             # ---- Trigger 2: flat take-profit fallback ----
