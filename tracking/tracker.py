@@ -177,6 +177,11 @@ class TraderTracker:
                 _MAGENTA, _RESET, len(self._seen_ids),
             )
 
+            # Try to find the target's CLOB proxy wallet address.
+            # If found, swapping TRACK_ADDRESS to that address reduces detection
+            # lag from ~16s (Data API) to ~2-5s (CLOB API).
+            await self.detect_proxy_address()
+
             # Fetch target wallet value for proportional copy sizing
             await self.refresh_wallet_value()
 
@@ -552,6 +557,95 @@ class TraderTracker:
     # ------------------------------------------------------------------
     # Target wallet value (for proportional copy-trade sizing)
     # ------------------------------------------------------------------
+
+    async def detect_proxy_address(self) -> str | None:
+        """
+        Attempt to find the target's CLOB proxy wallet address from:
+          1. Known field names in raw Data API trade records
+          2. The /profile endpoint on the Data API
+
+        Logs the result clearly. If found, the user can set TRACK_ADDRESS
+        to the proxy address for direct CLOB polling (~2-5s lag vs ~16s).
+        """
+        if self._session is None:
+            return None
+
+        proxy: str | None = None
+
+        # ── Check raw trade fields ─────────────────────────────────────
+        try:
+            url    = f"{config.DATA_API}/activity"
+            params = {"user": self._address, "limit": 5}
+            async with self._session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    body = await resp.json(content_type=None)
+                    trades = body if isinstance(body, list) else body.get("data", [])
+                    for trade in (trades or []):
+                        log.debug("Tracker: raw trade keys: %s", list(trade.keys()))
+                        for field in (
+                            "proxyWallet", "proxy_wallet", "makerAddress", "maker_address",
+                            "takerAddress", "taker_address", "signer", "trader",
+                            "owner", "funder", "safeAddress", "safe_address",
+                        ):
+                            val = trade.get(field, "")
+                            if (
+                                isinstance(val, str)
+                                and val.startswith("0x")
+                                and len(val) >= 40
+                                and val.lower() != self._address
+                            ):
+                                proxy = val.lower()
+                                log.debug("Tracker: found proxy candidate in field '%s': %s", field, proxy)
+                                break
+                        if proxy:
+                            break
+        except Exception as exc:
+            log.debug("Tracker: proxy detection trade scan failed: %s", exc)
+
+        # ── Try /profile endpoint ──────────────────────────────────────
+        if not proxy:
+            try:
+                for endpoint in ("profile", "user"):
+                    url = f"{config.DATA_API}/{endpoint}"
+                    async with self._session.get(url, params={"address": self._address}) as resp:
+                        if resp.status == 200:
+                            body = await resp.json(content_type=None)
+                            if isinstance(body, dict):
+                                log.debug("Tracker: profile keys: %s", list(body.keys()))
+                                for field in (
+                                    "proxyWallet", "proxy_wallet", "clobAddress",
+                                    "clob_address", "safeAddress", "funder",
+                                ):
+                                    val = body.get(field, "")
+                                    if (
+                                        isinstance(val, str)
+                                        and val.startswith("0x")
+                                        and len(val) >= 40
+                                        and val.lower() != self._address
+                                    ):
+                                        proxy = val.lower()
+                                        break
+                            if proxy:
+                                break
+            except Exception as exc:
+                log.debug("Tracker: proxy detection profile lookup failed: %s", exc)
+
+        if proxy:
+            log.info(
+                "%s👁 TRACKER%s  proxy wallet found: %s%s%s\n"
+                "  → Set TRACK_ADDRESS=%s in .env to use CLOB directly "
+                "and cut detection lag from ~16s to ~2-5s.",
+                _MAGENTA, _RESET, _CYAN, proxy, _RESET, proxy,
+            )
+        else:
+            log.info(
+                "%s👁 TRACKER%s  proxy wallet not found in API data. "
+                "To find it manually: polygonscan.com/address/%s → Internal Txns → "
+                "look for 'From' address on Polymarket CLOB transactions.",
+                _MAGENTA, _RESET, self._address,
+            )
+
+        return proxy
 
     @property
     def target_wallet_value(self) -> float | None:
