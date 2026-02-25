@@ -53,6 +53,7 @@ import asyncio
 import logging
 import signal
 import sys
+import threading
 import time
 
 import config
@@ -254,16 +255,31 @@ Commands (type and press Enter):
     async def _console_loop(self) -> None:
         """
         Reads lines from stdin without blocking the event loop.
-        Uses run_in_executor so it works on both Windows and Linux.
+
+        A daemon thread blocks continuously on sys.stdin so Enter is always
+        registered — even when log output scrolls the terminal mid-type.
+        Commands are pushed into an asyncio Queue and dispatched on the
+        event loop, keeping all bot state single-threaded.
         """
-        loop = asyncio.get_running_loop()
+        loop  = asyncio.get_running_loop()
+        queue: asyncio.Queue[str] = asyncio.Queue()
+
+        def _reader() -> None:
+            try:
+                for line in sys.stdin:
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
+            except Exception:
+                pass
+
+        threading.Thread(target=_reader, daemon=True, name="stdin-reader").start()
+
         print(
             f"\n{_DIM}[console] Ready — type a command + Enter.{_RESET}\n",
             flush=True,
         )
         while True:
             try:
-                raw = await loop.run_in_executor(None, sys.stdin.readline)
+                raw = await queue.get()
             except Exception:
                 break
             cmd = raw.strip().lower()
