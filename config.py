@@ -120,9 +120,17 @@ class StrategyConfig:
     # Lookback window (seconds) over which we measure the move
     lookback_secs: float = 5.0
 
-    # Probability bounds — don't bet if market price is already extreme
-    min_yes_prob: float = 0.10
-    max_yes_prob: float = 0.90
+    # Probability bounds — don't bet if market price is already extreme.
+    # Tightened from 0.10/0.90: prices near the extremes mean the market has
+    # already fully priced the outcome; momentum adds no edge there.
+    min_yes_prob: float = 0.20
+    max_yes_prob: float = 0.80
+
+    # Minimum edge (fair_prob − market_price) required before placing a momentum
+    # order.  0.0 = require at least break-even (fair ≥ market).  Prevents
+    # buying tokens the model already considers overpriced.
+    # Example: Down at 0.895, model fair=0.494 → edge=−0.401 → blocked.
+    momentum_min_edge: float = 0.0
 
     # ---- Arbitrage sub-strategy (edge layer) ----
     # Minimum fair-value edge (in probability points) before we act.

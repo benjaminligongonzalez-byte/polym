@@ -373,6 +373,32 @@ class OrderManager:
             log.debug("Market %s: %s mid=%.3f outside range.", cid[:8], token_label, mid)
             return
 
+        # ── Fair-value gate ──────────────────────────────────────────────────
+        # Require model edge ≥ momentum_min_edge before entering.
+        # This prevents buying tokens the model considers overpriced and
+        # entering in the opposite direction from our own fair-value signal.
+        # If no consensus price or strike is available, skip — never trade blind.
+        from strategy.arbitrage import fair_prob_up  # local import avoids circular
+        consensus = self._aggregator.consensus_price(market.symbol)
+        if consensus is None or not market.strike_price:
+            log.debug(
+                "MOMENTUM gate: no consensus/strike for %s — skip.",
+                market.symbol,
+            )
+            return
+        vol  = config.VOLATILITY.get(market.symbol, config.DEFAULT_ANNUAL_VOL)
+        p_up = fair_prob_up(consensus, market.strike_price, max(t_rem, 5), vol)
+        fair = p_up if direction == "UP" else (1.0 - p_up)
+        edge = fair - mid
+        if edge < config.STRATEGY.momentum_min_edge:
+            log.debug(
+                "MOMENTUM gate: %s %s  fair=%.3f  mkt=%.3f  edge=%+.3f < min=%.3f — skip",
+                market.symbol, token_label, fair, mid, edge,
+                config.STRATEGY.momentum_min_edge,
+            )
+            return
+        # ────────────────────────────────────────────────────────────────────
+
         order_usdc = min(self._max_order_usdc, self._remaining_budget(market.symbol))
         if order_usdc < config.RISK.min_order_usdc:
             return
@@ -386,7 +412,7 @@ class OrderManager:
             question=market.question,
             symbol=market.symbol,
             strike_price=market.strike_price or 0.0,
-            source="MOMENTUM",
+            source=f"MOMENTUM fair={fair:.3f} edge={edge:+.3f}",
             is_snipe=False,
         )
 
@@ -859,4 +885,87 @@ class OrderManager:
                 lines.append(f"  {'·' * 56}")
 
         lines.append(f"{_BOLD}{'═' * 60}{_RESET}")
+        return "\n".join(lines)
+
+    def trades_report(self) -> str:
+        """Full session trade log — plain-text dump suitable for copy-paste analysis."""
+        uptime_secs = time.monotonic() - self._session_start
+        h, rem = divmod(int(uptime_secs), 3600)
+        m, s   = divmod(rem, 60)
+
+        priced   = [t for t in self._closed_trades if t.pnl_usdc is not None]
+        resolved = [t for t in self._closed_trades if t.close_type == "resolved"]
+        wins     = [t for t in priced if t.pnl_usdc > 0]
+        losses   = [t for t in priced if t.pnl_usdc <= 0]
+        realized = sum(t.pnl_usdc for t in priced)
+
+        W = 74  # report width
+        if priced:
+            summary = (
+                f"  realized_pnl={'+' if realized >= 0 else ''}${realized:.4f}  "
+                f"wins={len(wins)}  losses={len(losses)}  resolved={len(resolved)}  "
+                f"win_rate={len(wins)/len(priced)*100:.1f}%"
+            )
+        else:
+            summary = "  realized_pnl=$0.0000  no closed trades yet"
+
+        lines = [
+            "=" * W,
+            "  POLYMARKET BOT  —  FULL SESSION TRADE LOG",
+            f"  uptime {h:02d}h {m:02d}m {s:02d}s  |  "
+            f"orders={self._orders_placed}  open={len(self._positions)}  "
+            f"closed={len(self._closed_trades)}",
+            summary,
+            "=" * W,
+            f"  {'#':<3}  {'Sym':<4}  {'Dir':<5}  {'Strat':<10}  "
+            f"{'Entry':>7}  {'Exit':>7}  {'P&L':>10}  {'%':>7}  Close",
+            "-" * W,
+        ]
+
+        for i, t in enumerate(self._closed_trades, 1):
+            if t.pnl_usdc is not None and t.exit_price is not None:
+                pnl_str  = f"${t.pnl_usdc:+.4f}"
+                pct      = (t.exit_price - t.entry_price) / t.entry_price * 100
+                pct_str  = f"{pct:+.1f}%"
+                exit_str = f"{t.exit_price:.4f}"
+            else:
+                pnl_str  = "pending"
+                pct_str  = "─"
+                exit_str = "─"
+
+            strategy_tag  = t.source.split()[0]
+            duration_s    = int(t.closed_at - t.opened_at)
+            dur_m, dur_s2 = divmod(duration_s, 60)
+
+            lines.append(
+                f"  {i:<3}  {t.symbol:<4}  {t.bet:<5}  {strategy_tag:<10}  "
+                f"{t.entry_price:>7.4f}  {exit_str:>7}  {pnl_str:>10}  {pct_str:>7}  "
+                f"{t.close_type}  held={dur_m}m{dur_s2:02d}s"
+            )
+            lines.append(f"       {t.question[:68]}")
+            if i < len(self._closed_trades):
+                lines.append(f"  {'·' * (W - 4)}")
+
+        if not self._closed_trades:
+            lines.append("  (no trades recorded yet)")
+
+        lines += [
+            "=" * W,
+            f"  OPEN POSITIONS ({len(self._positions)}):",
+        ]
+        if self._positions:
+            now = time.monotonic()
+            for pos in self._positions.values():
+                age_s = int(now - pos.entered_at)
+                age_m2, age_s3 = divmod(age_s, 60)
+                lines.append(
+                    f"  {pos.symbol} {pos.bet:<5}  {pos.source.split()[0]:<10}  "
+                    f"entry={pos.entry_price:.4f}  cost=${pos.cost_usdc:.2f}  "
+                    f"held={age_m2}m{age_s3:02d}s"
+                )
+                lines.append(f"    {pos.question[:68]}")
+        else:
+            lines.append("  (none)")
+
+        lines.append("=" * W)
         return "\n".join(lines)

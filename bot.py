@@ -214,7 +214,8 @@ class Bot:
             f"  {_BOLD}POLYMARKET TRADING BOT{_RESET}  —  {mode_label}  |  {strats}\n"
             f"  Strategies: {strats}  |  Tasks: {len(self._tasks)}\n"
             f"  Commands: {_BOLD}s{_RESET}=stats  {_BOLD}p{_RESET}=positions  "
-            f"{_BOLD}m{_RESET}=markets  {_BOLD}pause{_RESET}  {_BOLD}drain{_RESET}  "
+            f"{_BOLD}m{_RESET}=markets  {_BOLD}t{_RESET}=trades  "
+            f"{_BOLD}pause{_RESET}  {_BOLD}drain{_RESET}  "
             f"{_BOLD}h{_RESET}=help  {_BOLD}q{_RESET}=quit\n"
             f"{_BOLD}{'═'*66}{_RESET}\n",
             flush=True,
@@ -245,6 +246,7 @@ Commands (type and press Enter):
   s  /  status     — full dashboard: balance, P&L, win rate, trade counts
   p  /  positions  — open positions (symbol, direction, entry price, age)
   m  /  markets    — active markets in cache with time remaining
+  t  /  trades     — full session trade log (copy-paste for analysis)
   pause            — stop new orders; let existing positions settle naturally
   resume           — resume trading after a pause
   drain            — pause + auto-shutdown once all open positions close
@@ -334,6 +336,12 @@ Commands (type and press Enter):
                     print("\n".join(lines), flush=True)
                 else:
                     print("  No markets in cache.", flush=True)
+
+            elif cmd in ("t", "trades"):
+                if om:
+                    print(om.trades_report(), flush=True)
+                else:
+                    print("  OrderManager not ready yet.", flush=True)
 
             elif cmd == "pause":
                 if om:
