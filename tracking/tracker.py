@@ -267,6 +267,22 @@ class TraderTracker:
                     _wallet_refresh_countdown = 0
                     await self.refresh_wallet_value()
 
+    def seed_known_markets(
+        self,
+        condition_map: dict[str, str],
+        token_map: dict[str, str],
+    ) -> None:
+        """
+        Pre-populate question and outcome caches from the bot's market cache
+        so we don't need gamma API calls for markets we already know about.
+        condition_map: {condition_id → question}
+        token_map:     {token_id    → outcome label (e.g. "Up"/"Down")}
+        """
+        self._question_cache.update(condition_map)
+        self._token_labels.update(token_map)
+        log.debug("Tracker: seeded %d markets, %d token labels from market cache",
+                  len(condition_map), len(token_map))
+
     def signal_activity(self, token_id: str) -> None:
         """
         Called by the ClobFeed when a last_trade_price event fires on a watched
@@ -558,7 +574,7 @@ class TraderTracker:
                     body    = await resp.json(content_type=None)
                     markets = body if isinstance(body, list) else body.get("markets", [])
                     if not markets:
-                        log.debug("Tracker: gamma %s → empty response", params)
+                        log.info("Tracker: gamma %s → empty response", params)
                         continue
                     m = markets[0]
                     q = m.get("question") or m.get("title") or ""
@@ -571,9 +587,10 @@ class TraderTracker:
                         out = tok.get("outcome") or ""
                         if tid:
                             self._token_labels[tid] = out
+                    log.info("Tracker: resolved market → %r", q)
                     return q
             except Exception as exc:
-                log.debug("Tracker: gamma lookup failed (%s): %s", params, exc)
+                log.info("Tracker: gamma lookup failed (%s): %s", params, exc)
 
         fallback = (condition_id or token_id)[:16] + "…"
         self._question_cache[cache_key] = fallback

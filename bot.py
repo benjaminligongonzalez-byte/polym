@@ -244,6 +244,16 @@ class Bot:
                 on_trade=self._on_tracked_trade,
                 price_feed=self._aggregator.price_at,
             )
+            # Seed tracker with market names + outcome labels from the local
+            # market cache so we never need a gamma API call for known markets.
+            if self._market_cache and self._market_cache._markets:
+                _cmap = {m.condition_id: m.question
+                         for m in self._market_cache._markets.values()}
+                _tmap = {}
+                for m in self._market_cache._markets.values():
+                    _tmap[m.up_token.token_id]   = m.up_token.outcome
+                    _tmap[m.down_token.token_id]  = m.down_token.outcome
+                self._tracker.seed_known_markets(_cmap, _tmap)
             self._tasks.append(
                 asyncio.create_task(self._tracker.run(), name="trader-tracker")
             )
