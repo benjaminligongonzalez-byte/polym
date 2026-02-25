@@ -439,8 +439,6 @@ Commands (type and press Enter):
                     )
                 else:
                     print("  Tracker starting up…", flush=True)
-                else:
-                    print("  OrderManager not ready yet.", flush=True)
 
             elif cmd == "pause":
                 if om:
