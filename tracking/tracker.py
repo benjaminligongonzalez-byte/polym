@@ -511,7 +511,7 @@ class TraderTracker:
             timestamp = time.time()
 
         # ── Market enrichment ─────────────────────────────────────────────
-        question = await self._get_question(condition_id)
+        question = await self._get_question(condition_id, token_id)
         outcome  = await self._get_outcome(token_id, condition_id, raw)
 
         return TrackedTrade(
@@ -527,36 +527,56 @@ class TraderTracker:
             timestamp=timestamp,
         )
 
-    async def _get_question(self, condition_id: str) -> str:
-        if not condition_id:
+    async def _get_question(self, condition_id: str, token_id: str = "") -> str:
+        if not condition_id and not token_id:
             return "(unknown market)"
-        if condition_id in self._question_cache:
-            return self._question_cache[condition_id]
+        cache_key = condition_id or token_id
+        if cache_key in self._question_cache:
+            return self._question_cache[cache_key]
 
-        try:
-            assert self._session is not None
-            url    = f"{config.GAMMA_API}/markets"
-            params = {"conditionId": condition_id}
-            async with self._session.get(url, params=params) as resp:
-                if resp.status == 200:
+        assert self._session is not None
+        url = f"{config.GAMMA_API}/markets"
+
+        # Try up to three query strategies in order
+        attempts = []
+        if condition_id:
+            # 1. conditionId with 0x prefix as-is
+            attempts.append({"conditionId": condition_id})
+            # 2. conditionId without 0x prefix (some API versions prefer this)
+            if condition_id.startswith("0x"):
+                attempts.append({"conditionId": condition_id[2:]})
+        if token_id:
+            # 3. clob_token_ids — most reliable when we have the token ID
+            attempts.append({"clob_token_ids": token_id})
+
+        for params in attempts:
+            try:
+                async with self._session.get(url, params=params) as resp:
+                    if resp.status != 200:
+                        log.debug("Tracker: gamma %s → HTTP %d", params, resp.status)
+                        continue
                     body    = await resp.json(content_type=None)
                     markets = body if isinstance(body, list) else body.get("markets", [])
-                    if markets:
-                        m = markets[0]
-                        q = m.get("question") or m.get("title") or condition_id[:20]
-                        self._question_cache[condition_id] = q
-                        # Cache token → outcome while we're here
-                        for tok in m.get("tokens") or m.get("outcomes") or []:
-                            tok_id   = tok.get("token_id") or tok.get("tokenId") or ""
-                            tok_out  = tok.get("outcome") or ""
-                            if tok_id:
-                                self._token_labels[tok_id] = tok_out
-                        return q
-        except Exception as exc:
-            log.debug("Tracker: gamma lookup failed for %s: %s", condition_id[:12], exc)
+                    if not markets:
+                        log.debug("Tracker: gamma %s → empty response", params)
+                        continue
+                    m = markets[0]
+                    q = m.get("question") or m.get("title") or ""
+                    if not q:
+                        continue
+                    self._question_cache[cache_key] = q
+                    # Cache token → outcome labels while we're here
+                    for tok in m.get("tokens") or m.get("outcomes") or []:
+                        tid = tok.get("token_id") or tok.get("tokenId") or ""
+                        out = tok.get("outcome") or ""
+                        if tid:
+                            self._token_labels[tid] = out
+                    return q
+            except Exception as exc:
+                log.debug("Tracker: gamma lookup failed (%s): %s", params, exc)
 
-        fallback = condition_id[:16] + "…"
-        self._question_cache[condition_id] = fallback
+        fallback = (condition_id or token_id)[:16] + "…"
+        self._question_cache[cache_key] = fallback
         return fallback
 
     async def _get_outcome(
@@ -572,8 +592,8 @@ class TraderTracker:
             return self._token_labels[token_id]
 
         # Side effect of _get_question populates self._token_labels
-        if condition_id:
-            await self._get_question(condition_id)
+        if condition_id or token_id:
+            await self._get_question(condition_id, token_id)
 
         return self._token_labels.get(token_id, "?")
 
