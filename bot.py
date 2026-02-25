@@ -113,6 +113,7 @@ class Bot:
         self._coinbase_feed: CoinbaseFeed | None = None
 
         self._tasks: list[asyncio.Task] = []
+        self._drain_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         log.info("=== Polymarket Trading Bot starting ===")
@@ -248,7 +249,7 @@ Commands (type and press Enter):
   m  /  markets    — active markets in cache with time remaining
   t  /  trades     — full session trade log (copy-paste for analysis)
   pause            — stop new orders; let existing positions settle naturally
-  resume           — resume trading after a pause
+  resume           — resume trading after a pause (also cancels drain)
   drain            — pause + auto-shutdown once all open positions close
   h  /  help       — this message
   q  /  quit       — immediate graceful shutdown (Ctrl+C equivalent)
@@ -357,6 +358,10 @@ Commands (type and press Enter):
 
             elif cmd == "resume":
                 if om:
+                    if self._drain_task and not self._drain_task.done():
+                        self._drain_task.cancel()
+                        self._drain_task = None
+                        print("  Drain cancelled.", flush=True)
                     om.resume()
                     print("  Resumed. New orders are enabled.", flush=True)
                 else:
@@ -364,22 +369,22 @@ Commands (type and press Enter):
 
             elif cmd == "drain":
                 if om:
-                    om.pause()
-                    n = len(om._positions)
-                    if n == 0:
+                    if self._drain_task and not self._drain_task.done():
+                        print("  Already draining. Type 'resume' to cancel drain.", flush=True)
+                    else:
+                        om.pause()
+                        n = len(om._positions)
+                        if n == 0:
+                            print("  No open positions — shutting down now.", flush=True)
+                            loop.create_task(self.stop())
+                            break
                         print(
-                            "  No open positions — shutting down now.",
+                            f"  DRAIN MODE: {n} position(s) open. "
+                            "No new orders. Auto-shutdown when all settle. "
+                            "Type 'resume' to cancel drain.",
                             flush=True,
                         )
-                        loop.create_task(self.stop())
-                        break
-                    print(
-                        f"  DRAIN MODE: {n} position(s) open. "
-                        "No new orders. Will auto-shutdown when all settle.",
-                        flush=True,
-                    )
-                    loop.create_task(self._drain_loop())
-                    break   # stop reading stdin — drain task will finish the job
+                        self._drain_task = loop.create_task(self._drain_loop())
                 else:
                     print("  OrderManager not ready yet.", flush=True)
 
