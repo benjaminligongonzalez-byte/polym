@@ -160,6 +160,7 @@ class MarketCache:
         self._markets: dict[str, MarketInfo] = {}
         self._last_full_refresh: float = 0.0
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_logged_count: int = -1   # track when count changes for INFO log
 
     async def start(self) -> None:
         self._session = aiohttp.ClientSession(
@@ -172,7 +173,7 @@ class MarketCache:
             await self._session.close()
 
     async def refresh(self) -> None:
-        log.info("Refreshing market cache from Gamma API …")
+        log.debug("Refreshing market cache from Gamma API …")
         try:
             markets, had_errors = await self._fetch_gamma_markets()
             new_cache: dict[str, MarketInfo] = {}
@@ -198,7 +199,12 @@ class MarketCache:
 
             self._markets = new_cache
             self._last_full_refresh = time.monotonic()
-            log.info("Market cache: %d tradeable markets found.", len(self._markets))
+            n = len(self._markets)
+            if n != self._last_logged_count:
+                log.info("Market cache: %d tradeable markets found.", n)
+                self._last_logged_count = n
+            else:
+                log.debug("Market cache: %d tradeable markets (unchanged).", n)
         except Exception as exc:
             log.error("Market refresh failed: %s", exc)
 
@@ -237,7 +243,7 @@ class MarketCache:
                     if isinstance(event, list):
                         event = event[0] if event else {}
                     mkts = event.get("markets", [])
-                    log.info("Slug hit: %s → %d market(s)", slug, len(mkts))
+                    log.debug("Slug hit: %s → %d market(s)", slug, len(mkts))
                     for m in mkts:
                         cid = m.get("conditionId", "")
                         if cid not in seen_cids:
@@ -250,9 +256,9 @@ class MarketCache:
         if not raw_markets:
             log.warning("Slug lookup: all slugs returned 404 — no active 15-min markets found.")
         else:
-            log.info("Slug lookup: %d raw markets before filtering.", len(raw_markets))
+            log.debug("Slug lookup: %d raw markets before filtering.", len(raw_markets))
             for r in raw_markets[:8]:
-                log.info("  question: %r", r.get("question", r.get("title", "(no question)")))
+                log.debug("  question: %r", r.get("question", r.get("title", "(no question)")))
 
         results: list[MarketInfo] = []
         for raw in raw_markets:
