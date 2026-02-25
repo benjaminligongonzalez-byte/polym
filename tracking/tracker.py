@@ -21,6 +21,7 @@ Console commands added by bot.py:
 from __future__ import annotations
 
 import asyncio
+import collections
 import datetime
 import logging
 import time
@@ -94,6 +95,36 @@ class TrackedTrade:
         return None
 
 
+@dataclass
+class LoggedTrade:
+    """Enriched record of a single observed trade, stored for strategy analysis."""
+    trade:       TrackedTrade
+    detected_at: float   # unix epoch: when our bot first saw this trade
+    seq:         int     # trade number within this session (1-based)
+    pos_before:  float   # net shares in this token BEFORE this trade
+    pos_after:   float   # net shares AFTER this trade
+    trade_type:  str     # OPEN / ADD / TRIM / CLOSE / FLIP / SHORT / ADD_S / COVER
+
+    @property
+    def lag(self) -> float:
+        return self.detected_at - self.trade.timestamp
+
+    @property
+    def price_cents(self) -> float:
+        return self.trade.price * 100
+
+    def _infer_type(side: str, pos_before: float, pos_after: float) -> str:
+        if side == "BUY":
+            if pos_before == 0:       return "OPEN"
+            if pos_before > 0:        return "ADD"
+            if pos_after >= 0:        return "FLIP"
+            return "COVER"
+        else:  # SELL
+            if pos_before <= 0:       return "SHORT"
+            if pos_after <= 0:        return "CLOSE"
+            return "TRIM"
+
+
 # ---------------------------------------------------------------------------
 # Tracker
 # ---------------------------------------------------------------------------
@@ -149,6 +180,10 @@ class TraderTracker:
         # Copy-trade warmup: suppress signals for this many seconds after startup
         # to avoid acting on the initial high-lag backlog of trades.
         self._COPY_WARMUP_SECS: float = 60.0
+
+        # Strategy-analysis log: every trade this session, fully enriched
+        self._logged_trades: list[LoggedTrade] = []
+        self._session_seq:   int = 0   # monotonically increments per trade
 
         # Stats
         self._total_seen:  int = 0
@@ -549,6 +584,21 @@ class TraderTracker:
     # ------------------------------------------------------------------
 
     def _log_trade(self, trade: TrackedTrade) -> None:
+        # ── Strategy-analysis record ──────────────────────────────────────────
+        key        = trade.token_id or trade.condition_id
+        pos_before = self._net_shares.get(key, 0.0)
+        delta      = trade.size if trade.side == "BUY" else -trade.size
+        pos_after  = pos_before + delta
+        self._session_seq += 1
+        self._logged_trades.append(LoggedTrade(
+            trade       = trade,
+            detected_at = time.time(),
+            seq         = self._session_seq,
+            pos_before  = pos_before,
+            pos_after   = pos_after,
+            trade_type  = LoggedTrade._infer_type(trade.side, pos_before, pos_after),
+        ))
+        # ─────────────────────────────────────────────────────────────────────
         side_col = _GREEN if trade.side == "BUY" else _RED
         side_tag = f"{side_col}{'[BUY] ' if trade.side == 'BUY' else '[SELL]'}{_RESET}"
 
@@ -767,36 +817,213 @@ class TraderTracker:
     # Status report (for 'w' console command)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Helpers for status_report
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _shorten_market(q: str, maxlen: int = 32) -> str:
+        q = (q.replace("Up or Down - ", "").replace("Up or Down — ", "")
+               .replace("Bitcoin", "BTC").replace("Ethereum", "ETH")
+               .replace("Solana", "SOL").replace("Ripple", "XRP"))
+        return q[:maxlen]
+
+    @staticmethod
+    def _median(vals: list[float]) -> float:
+        if not vals:
+            return 0.0
+        s = sorted(vals)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
     def status_report(self) -> str:
         uptime = time.monotonic() - self._started_at
-        h, m = divmod(int(uptime) // 60, 60)
-        s = int(uptime) % 60
+        h, m   = divmod(int(uptime) // 60, 60)
+        s_rem  = int(uptime) % 60
 
-        lines = [
-            "",
-            f"{_MAGENTA}{_BOLD}👁  COPY-WATCH — {self._address}{_RESET}",
-            f"  uptime     : {h:02d}h {m:02d}m {s:02d}s",
-            f"  trades seen: {self._total_seen}  (new since start)",
-            f"  positions  : {len(self._net_shares)} open tokens tracked",
-        ]
+        W = 88  # table width
+        SEP  = "═" * W
+        sep  = "─" * W
 
-        if self._net_shares:
-            lines.append("")
-            lines.append(f"  {'Outcome / Market':<45}  {'Net Shares':>10}")
-            lines.append("  " + "─" * 58)
-            # Sort by abs position size descending
-            sorted_pos = sorted(
-                self._net_shares.items(), key=lambda kv: -abs(kv[1])
+        lines = ["", SEP]
+        lines.append(
+            f"👁  TRADE LOG — {self._address}"
+        )
+        lines.append(
+            f"   Session {h:02d}h {m:02d}m {s_rem:02d}s  |  "
+            f"{len(self._logged_trades)} trades recorded  |  "
+            f"{len(set(lt.trade.token_id for lt in self._logged_trades))} unique tokens  |  "
+            f"{len(self._net_shares)} open positions"
+        )
+        lines.append(SEP)
+
+        # ── Full trade log ────────────────────────────────────────────────────
+        if not self._logged_trades:
+            lines.append("  (no trades yet)")
+        else:
+            hdr = (
+                f"  {'#':>4}  {'TIME':8}  {'LAG':>5}  {'TYPE':5}  {'SIDE':4}  "
+                f"{'DIR':4}  {'PRICE':>6}  {'SHARES':>7}  {'USD':>7}  "
+                f"{'BEFORE':>7}  {'AFTER':>7}  MARKET"
             )
-            for tok, shares in sorted_pos:
-                label   = self._token_labels.get(tok, "?")
-                q       = self._token_questions.get(tok, tok[:20])
-                col     = _GREEN if shares > 0 else _RED
-                dir_sym = "▲" if shares > 0 else "▼"
+            lines += ["", hdr, "  " + sep]
+
+            for lt in self._logged_trades:
+                t      = lt.trade
+                ts_str = datetime.datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
+                lag_s  = int(lt.lag)
+                side_s = "BUY " if t.side == "BUY" else "SELL"
+                dir_s  = (t.direction or "?").ljust(4)
+                mkt    = self._shorten_market(t.question, 30)
                 lines.append(
-                    f"  {dir_sym} {label:<6} {q[:38]:<38}  "
-                    f"{col}{shares:>+10.1f}{_RESET}"
+                    f"  {lt.seq:>4}  {ts_str}  {lag_s:>4}s  {lt.trade_type:<5}  {side_s}  "
+                    f"{dir_s}  {lt.price_cents:>5.1f}¢  {t.size:>7.1f}  ${t.amount:>6.2f}  "
+                    f"{lt.pos_before:>+7.1f}  {lt.pos_after:>+7.1f}  {mkt}"
                 )
 
-        lines.append("")
+        # ── Summary ───────────────────────────────────────────────────────────
+        if self._logged_trades:
+            buys  = [lt for lt in self._logged_trades if lt.trade.side == "BUY"]
+            sells = [lt for lt in self._logged_trades if lt.trade.side == "SELL"]
+
+            type_counts: dict[str, int] = collections.Counter(
+                lt.trade_type for lt in self._logged_trades
+            )
+            type_str = "  ".join(f"{k}:{v}" for k, v in sorted(type_counts.items()))
+
+            buy_p  = [lt.price_cents for lt in buys]
+            sell_p = [lt.price_cents for lt in sells]
+            all_u  = [lt.trade.amount for lt in self._logged_trades]
+
+            lags   = [lt.lag for lt in self._logged_trades]
+
+            lines += ["", SEP, "  SUMMARY", "  " + sep]
+            lines.append(
+                f"  Buys: {len(buys)}  Sells: {len(sells)}  Total: {len(self._logged_trades)}"
+            )
+            lines.append(f"  Trade types: {type_str}")
+            if buy_p:
+                lines.append(
+                    f"  BUY  prices: {min(buy_p):.1f}–{max(buy_p):.1f}¢  "
+                    f"avg {sum(buy_p)/len(buy_p):.1f}¢  median {self._median(buy_p):.1f}¢"
+                )
+            if sell_p:
+                lines.append(
+                    f"  SELL prices: {min(sell_p):.1f}–{max(sell_p):.1f}¢  "
+                    f"avg {sum(sell_p)/len(sell_p):.1f}¢  median {self._median(sell_p):.1f}¢"
+                )
+            if all_u:
+                lines.append(
+                    f"  Trade $ size: min ${min(all_u):.2f}  max ${max(all_u):.2f}  "
+                    f"avg ${sum(all_u)/len(all_u):.2f}"
+                )
+            if lags:
+                lines.append(
+                    f"  Detection lag: min {min(lags):.0f}s  max {max(lags):.0f}s  "
+                    f"avg {sum(lags)/len(lags):.0f}s"
+                )
+
+            # ── Per-token breakdown ───────────────────────────────────────────
+            by_token: dict[str, list[LoggedTrade]] = collections.defaultdict(list)
+            for lt in self._logged_trades:
+                by_token[lt.trade.token_id].append(lt)
+
+            lines += ["", SEP, "  TOKEN BREAKDOWN  (sorted by trade count)", "  " + sep]
+            hdr2 = (
+                f"  {'TOKEN':18}  {'MARKET':32}  "
+                f"{'B':>3} {'S':>3}  {'PRICE RANGE':14}  {'AVG':>5}  DIRS"
+            )
+            lines.append(hdr2)
+            lines.append("  " + sep)
+            for tok, trades in sorted(by_token.items(), key=lambda kv: -len(kv[1])):
+                t0     = trades[0].trade
+                mkt    = self._shorten_market(t0.question, 32)
+                n_b    = sum(1 for lt in trades if lt.trade.side == "BUY")
+                n_s    = sum(1 for lt in trades if lt.trade.side == "SELL")
+                prices = [lt.price_cents for lt in trades]
+                dir_ct: dict[str, int] = collections.Counter(
+                    (lt.trade.direction or "?") for lt in trades
+                )
+                dir_str = " ".join(f"{d}:{n}" for d, n in sorted(dir_ct.items()))
+                lines.append(
+                    f"  {tok[:16]+'…':18}  {mkt:<32}  "
+                    f"{n_b:>3} {n_s:>3}  "
+                    f"{min(prices):>5.1f}–{max(prices):>5.1f}¢  "
+                    f"avg {sum(prices)/len(prices):>4.1f}¢  {dir_str}"
+                )
+
+            # ── Hold duration analysis ────────────────────────────────────────
+            hold_times: list[float] = []
+            for tok, trades in by_token.items():
+                sorted_t = sorted(trades, key=lambda lt: lt.trade.timestamp)
+                pending: list[float] = []
+                for lt in sorted_t:
+                    if lt.trade.side == "BUY":
+                        pending.append(lt.trade.timestamp)
+                    elif lt.trade.side == "SELL" and pending:
+                        dt = lt.trade.timestamp - pending.pop(0)
+                        if 0 < dt < 7200:
+                            hold_times.append(dt)
+
+            if hold_times:
+                buckets = {"<5s": 0, "5-15s": 0, "15-30s": 0, "30-60s": 0, "60-120s": 0, ">120s": 0}
+                for dt in hold_times:
+                    if   dt <  5:  buckets["<5s"]    += 1
+                    elif dt < 15:  buckets["5-15s"]  += 1
+                    elif dt < 30:  buckets["15-30s"] += 1
+                    elif dt < 60:  buckets["30-60s"] += 1
+                    elif dt < 120: buckets["60-120s"] += 1
+                    else:          buckets[">120s"]  += 1
+                bkt_str = "  ".join(f"{k}:{v}" for k, v in buckets.items() if v)
+                lines += ["", SEP, "  HOLD DURATIONS  (inferred BUY→SELL pairs)", "  " + sep]
+                lines.append(
+                    f"  Pairs found: {len(hold_times)}  "
+                    f"min {min(hold_times):.0f}s  max {max(hold_times):.0f}s  "
+                    f"avg {sum(hold_times)/len(hold_times):.0f}s  "
+                    f"median {self._median(hold_times):.0f}s"
+                )
+                lines.append(f"  Distribution: {bkt_str}")
+
+            # ── Scale-in pattern analysis ─────────────────────────────────────
+            # For each OPEN trade, count how many ADD trades follow before CLOSE
+            scale_counts: list[int] = []
+            for tok, trades in by_token.items():
+                sorted_t = sorted(trades, key=lambda lt: lt.trade.timestamp)
+                in_position = False
+                adds = 0
+                for lt in sorted_t:
+                    if lt.trade_type == "OPEN":
+                        in_position = True
+                        adds = 0
+                    elif lt.trade_type == "ADD" and in_position:
+                        adds += 1
+                    elif lt.trade_type in ("CLOSE", "FLIP") and in_position:
+                        scale_counts.append(adds)
+                        in_position = False
+                        adds = 0
+            if scale_counts:
+                avg_adds = sum(scale_counts) / len(scale_counts)
+                max_adds = max(scale_counts)
+                lines += ["", SEP, "  SCALE-IN PATTERN", "  " + sep]
+                lines.append(
+                    f"  Positions tracked: {len(scale_counts)}  "
+                    f"avg ADD trades before close: {avg_adds:.1f}  "
+                    f"max: {max_adds}"
+                )
+                dist = collections.Counter(scale_counts)
+                dist_str = "  ".join(f"{k}adds:{v}x" for k, v in sorted(dist.items()))
+                lines.append(f"  Distribution: {dist_str}")
+
+        # ── Open positions ────────────────────────────────────────────────────
+        if self._net_shares:
+            lines += ["", SEP, "  OPEN POSITIONS NOW", "  " + sep]
+            for tok, shares in sorted(self._net_shares.items(), key=lambda kv: -abs(kv[1])):
+                label   = self._token_labels.get(tok, "?")
+                q       = self._shorten_market(self._token_questions.get(tok, tok[:20]), 40)
+                dir_sym = "▲" if shares > 0 else "▼"
+                lines.append(
+                    f"  {dir_sym} {label:<4}  {tok[:16]}…  {shares:>+8.1f} shares  {q}"
+                )
+
+        lines += [SEP, ""]
         return "\n".join(lines)
