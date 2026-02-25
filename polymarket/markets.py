@@ -154,7 +154,7 @@ class MarketCache:
     Refreshes from the Gamma API every REFRESH_INTERVAL seconds.
     """
 
-    REFRESH_INTERVAL = 60.0
+    REFRESH_INTERVAL = 15.0   # was 60s — 15s catches new windows within one tick
 
     def __init__(self) -> None:
         self._markets: dict[str, MarketInfo] = {}

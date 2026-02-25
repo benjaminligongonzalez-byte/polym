@@ -300,6 +300,23 @@ STRATEGY = StrategyConfig()
 RISK = RiskConfig()
 
 # ---------------------------------------------------------------------------
+# Trader tracker  (live copy-watch for a target wallet address)
+# ---------------------------------------------------------------------------
+
+# Polymarket wallet address to shadow.  Set TRACK_ADDRESS in .env, or pass
+# on the command line.  Leave blank to disable the tracker entirely.
+TRACK_ADDRESS: str = os.environ.get("TRACK_ADDRESS", "")
+
+# How often (seconds) to poll the Data API / CLOB API for new trades.
+# Lower = faster alerts; Polymarket APIs can handle ~4 req/s comfortably.
+TRACKER_POLL_SECS: float = float(os.environ.get("TRACKER_POLL_SECS", "10"))
+
+# Set to "true" to automatically copy-trade any market-mapped BUY the
+# target places, routed through the bot's normal gates (fair-value, TA,
+# risk management).  We never blindly copy — all our filters still apply.
+TRACKER_COPY_TRADE: bool = os.environ.get("TRACKER_COPY_TRADE", "false").lower() == "true"
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 LOG_LEVEL: str = os.environ.get("LOG_LEVEL", "INFO")

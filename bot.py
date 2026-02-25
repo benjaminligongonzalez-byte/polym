@@ -74,6 +74,7 @@ from polymarket.markets import MarketCache
 from polymarket.orders import OrderManager
 from strategy.momentum import MomentumStrategy
 from strategy.arbitrage import ArbStrategy
+from tracking.tracker import TraderTracker
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +115,7 @@ class Bot:
 
         self._tasks: list[asyncio.Task] = []
         self._drain_task: asyncio.Task | None = None
+        self._tracker: TraderTracker | None = None
 
     async def start(self) -> None:
         log.info("=== Polymarket Trading Bot starting ===")
@@ -203,6 +205,17 @@ class Bot:
                 asyncio.create_task(self._arb.run(), name="arb-scanner")
             )
 
+        # Optional: live trade tracker for a target Polymarket wallet
+        if config.TRACK_ADDRESS:
+            copy_cb = self._on_tracked_trade if config.TRACKER_COPY_TRADE else None
+            self._tracker = TraderTracker(
+                address=config.TRACK_ADDRESS,
+                on_trade=copy_cb,
+            )
+            self._tasks.append(
+                asyncio.create_task(self._tracker.run(), name="trader-tracker")
+            )
+
         # 7. Start interactive console (stdin command reader)
         self._tasks.append(
             asyncio.create_task(self._console_loop(), name="console")
@@ -242,6 +255,36 @@ class Bot:
         log.info("Bot stopped.")
 
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Copy-trade callback
+    # ------------------------------------------------------------------
+
+    async def _on_tracked_trade(self, trade: "TraderTracker") -> None:  # type: ignore[name-defined]
+        """
+        Fired by TraderTracker when the target address places a new BUY.
+
+        Routes through the bot's normal momentum signal path so every gate
+        (fair-value, TA, risk, cooldown) still applies — we never blindly copy.
+        """
+        from tracking.tracker import TrackedTrade
+        if not isinstance(trade, TrackedTrade):
+            return
+        if trade.side != "BUY":
+            return  # don't copy sells
+        om = self._order_manager
+        if om is None or om.paused:
+            return
+        sym       = trade.symbol
+        direction = trade.direction
+        if sym is None or direction is None:
+            return  # not a market we trade
+        log.info(
+            "COPY-TRADE signal: %s %s @ %.2f¢ — routing through execute_signal",
+            sym, direction, trade.price * 100,
+        )
+        await om.execute_signal(sym, direction, price_move_pct=0.0)
+
+    # ------------------------------------------------------------------
     # Interactive console
     # ------------------------------------------------------------------
 
@@ -251,6 +294,7 @@ Commands (type and press Enter):
   p  /  positions  — open positions (symbol, direction, entry price, age)
   m  /  markets    — active markets in cache with time remaining
   t  /  trades     — full session trade log (copy-paste for analysis)
+  w  /  watch      — copy-watch tracker: target address positions + recent trades
   pause            — stop new orders; let existing positions settle naturally
   resume           — resume trading after a pause (also cancels drain)
   drain            — pause + auto-shutdown once all open positions close
@@ -344,6 +388,17 @@ Commands (type and press Enter):
             elif cmd in ("t", "trades"):
                 if om:
                     print(om.trades_report(), flush=True)
+
+            elif cmd in ("w", "watch"):
+                if self._tracker:
+                    print(self._tracker.status_report(), flush=True)
+                elif not config.TRACK_ADDRESS:
+                    print(
+                        "  Tracker not configured — set TRACK_ADDRESS in .env",
+                        flush=True,
+                    )
+                else:
+                    print("  Tracker starting up…", flush=True)
                 else:
                     print("  OrderManager not ready yet.", flush=True)
 
