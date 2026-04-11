@@ -98,12 +98,14 @@ class TrackedTrade:
 @dataclass
 class LoggedTrade:
     """Enriched record of a single observed trade, stored for strategy analysis."""
-    trade:       TrackedTrade
-    seq:         int           # trade number within this session (1-based)
-    pos_before:  float         # net shares in this token BEFORE this trade
-    pos_after:   float         # net shares AFTER this trade
-    trade_type:  str           # OPEN / ADD / TRIM / CLOSE / FLIP / SHORT / ADD_S / COVER
-    spot_price:  float | None  # consensus crypto spot price at time of trade (USD)
+    trade:        TrackedTrade
+    seq:          int           # trade number within this session (1-based)
+    pos_before:   float         # net shares in this token BEFORE this trade
+    pos_after:    float         # net shares AFTER this trade
+    trade_type:   str           # OPEN / ADD / TRIM / CLOSE / FLIP / SHORT / ADD_S / COVER
+    spot_price:   float | None  # consensus crypto spot price at time of trade (USD)
+    avg_cost:     float         # avg $/share paid for current long position
+    realized_pnl: float | None  # P&L in USDC (SELL trades only; None for BUY)
 
     @property
     def price_cents(self) -> float:
@@ -168,6 +170,8 @@ class TraderTracker:
 
         # Aggregated position view: token_id → net shares (+ = long, − = sold)
         self._net_shares: dict[str, float] = {}
+        # token_id → weighted average cost per share for current long position
+        self._avg_cost: dict[str, float] = {}
         # token_id → question (for display in status_report)
         self._token_questions: dict[str, str] = {}
 
@@ -625,14 +629,39 @@ class TraderTracker:
         delta       = trade.size if trade.side == "BUY" else -trade.size
         pos_after   = pos_before + delta
         spot        = self._price_feed(trade.symbol, trade.timestamp) if self._price_feed and trade.symbol else None
+
+        # ── Cost basis + realized P&L ─────────────────────────────────────────
+        avg_cost     = self._avg_cost.get(key, 0.0)
+        realized_pnl: float | None = None
+
+        if trade.side == "BUY":
+            # Update weighted average entry price for this long position.
+            # If we were short (or flat), reset cost basis to this entry price.
+            if pos_before <= 0:
+                new_avg = trade.price        # fresh long: avg cost = entry price
+            else:
+                total   = pos_before + trade.size
+                new_avg = (avg_cost * pos_before + trade.price * trade.size) / total
+            self._avg_cost[key] = new_avg
+        else:  # SELL
+            if pos_before > 0 and avg_cost > 0:
+                shares_closed = min(trade.size, pos_before)
+                realized_pnl  = (trade.price - avg_cost) * shares_closed
+            # Average cost of remaining shares doesn't change on partial sell;
+            # clear cost basis when the position fully closes.
+            if pos_after <= 0:
+                self._avg_cost.pop(key, None)
+
         self._session_seq += 1
         self._logged_trades.append(LoggedTrade(
-            trade      = trade,
-            seq        = self._session_seq,
-            pos_before = pos_before,
-            pos_after  = pos_after,
-            trade_type = LoggedTrade._infer_type(trade.side, pos_before, pos_after),
-            spot_price = spot,
+            trade        = trade,
+            seq          = self._session_seq,
+            pos_before   = pos_before,
+            pos_after    = pos_after,
+            trade_type   = LoggedTrade._infer_type(trade.side, pos_before, pos_after),
+            spot_price   = spot,
+            avg_cost     = avg_cost,
+            realized_pnl = realized_pnl,
         ))
         # ─────────────────────────────────────────────────────────────────────
         side_col = _GREEN if trade.side == "BUY" else _RED
@@ -900,7 +929,7 @@ class TraderTracker:
             hdr = (
                 f"  {'#':>4}  {'TIME':8}  {'TYPE':5}  {'SIDE':4}  "
                 f"{'DIR':4}  {'BET':>6}  {'SHARES':>7}  {'USD':>7}  "
-                f"{'BEFORE':>7}  {'AFTER':>7}  {'SPOT':>10}  MARKET"
+                f"{'BEFORE':>7}  {'AFTER':>7}  {'P&L':>8}  {'SPOT':>10}  MARKET"
             )
             lines += ["", hdr, "  " + sep]
 
@@ -909,12 +938,16 @@ class TraderTracker:
                 ts_str = datetime.datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
                 side_s = "BUY " if t.side == "BUY" else "SELL"
                 dir_s  = (t.direction or "?").ljust(4)
-                mkt    = self._shorten_market(t.question, 30)
+                mkt    = self._shorten_market(t.question, 28)
                 spot_s = f"${lt.spot_price:,.2f}" if lt.spot_price else "     n/a"
+                if lt.realized_pnl is not None:
+                    pnl_s = f"{lt.realized_pnl:>+7.2f}"
+                else:
+                    pnl_s = "       "
                 lines.append(
                     f"  {lt.seq:>4}  {ts_str}  {lt.trade_type:<5}  {side_s}  "
                     f"{dir_s}  {lt.price_cents:>5.1f}¢  {t.size:>7.1f}  ${t.amount:>6.2f}  "
-                    f"{lt.pos_before:>+7.1f}  {lt.pos_after:>+7.1f}  {spot_s:>10}  {mkt}"
+                    f"{lt.pos_before:>+7.1f}  {lt.pos_after:>+7.1f}  {pnl_s}  {spot_s:>10}  {mkt}"
                 )
 
         # ── Summary ───────────────────────────────────────────────────────────
@@ -931,11 +964,20 @@ class TraderTracker:
             sell_p = [lt.price_cents for lt in sells]
             all_u  = [lt.trade.amount for lt in self._logged_trades]
 
+            realized = [lt.realized_pnl for lt in self._logged_trades if lt.realized_pnl is not None]
+            total_pnl = sum(realized) if realized else None
+
             lines += ["", SEP, "  SUMMARY", "  " + sep]
             lines.append(
                 f"  Buys: {len(buys)}  Sells: {len(sells)}  Total: {len(self._logged_trades)}"
             )
             lines.append(f"  Trade types: {type_str}")
+            if total_pnl is not None:
+                pnl_sign = "+" if total_pnl >= 0 else ""
+                lines.append(
+                    f"  Realized P&L: {pnl_sign}${total_pnl:.2f} USDC "
+                    f"({len(realized)} closed trades)"
+                )
             if buy_p:
                 lines.append(
                     f"  BUY  prices: {min(buy_p):.1f}–{max(buy_p):.1f}¢  "
