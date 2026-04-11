@@ -44,6 +44,8 @@ Flags
 --no-momentum   Disable momentum strategy (arb only)
 --no-arb        Disable arb strategy (momentum only)
 --loglevel      DEBUG / INFO / WARNING / ERROR  (default INFO)
+--rust          Use polyfill-rs Rust CLOB client instead of py-clob-client
+                (requires:  cd polyfill_py && maturin develop --release)
 """
 
 from __future__ import annotations
@@ -71,6 +73,7 @@ from feeds.coinbase import CoinbaseFeed
 from feeds.aggregator import PriceAggregator, make_feed_callback
 from polymarket.client import PolymarketClient
 from polymarket.markets import MarketCache
+# Rust client imported lazily in Bot.__init__ when --rust is passed
 from polymarket.orders import OrderManager
 from strategy.momentum import MomentumStrategy
 from strategy.arbitrage import ArbStrategy
@@ -104,13 +107,19 @@ class Bot:
         use_momentum: bool = True,
         use_arb: bool = True,
         copy_mode: str = "",
+        use_rust: bool = False,
     ) -> None:
         self._use_momentum = use_momentum
         self._use_arb = use_arb
         # "blind" | "gated" | "" (off).  Can be toggled live via console.
         self._copy_mode: str = copy_mode or config.TRACKER_COPY_MODE if config.TRACKER_COPY_TRADE else ""
 
-        self._pm_client = PolymarketClient()
+        if use_rust:
+            from polymarket.rust_bridge import RustPolymarketClient
+            self._pm_client = RustPolymarketClient()
+            log.info("Using polyfill-rs Rust CLOB client.")
+        else:
+            self._pm_client = PolymarketClient()
         self._market_cache = MarketCache()
         self._aggregator = PriceAggregator()
 
@@ -624,6 +633,7 @@ async def main(args: argparse.Namespace) -> None:
         use_momentum=not args.no_momentum,
         use_arb=not args.no_arb,
         copy_mode=copy_mode,
+        use_rust=args.rust,
     )
 
     loop = asyncio.get_running_loop()
@@ -674,6 +684,15 @@ if __name__ == "__main__":
         default=config.LOG_LEVEL,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO)",
+    )
+    parser.add_argument(
+        "--rust",
+        action="store_true",
+        default=False,
+        help=(
+            "Use the polyfill-rs Rust CLOB client (4.2x faster market fetching). "
+            "Requires:  cd polyfill_py && maturin develop --release"
+        ),
     )
     copy_group = parser.add_mutually_exclusive_group()
     copy_group.add_argument(
